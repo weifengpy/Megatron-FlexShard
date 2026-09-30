@@ -1068,6 +1068,27 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
+    if args.use_flex_shard:
+        assert not (args.use_torch_fsdp2 or args.use_megatron_fsdp), \
+            '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
+        assert args.pipeline_model_parallel_size == 1, \
+            '--use-flex-shard is not supported with pipeline parallelism'
+        assert args.tensor_model_parallel_size == 1, \
+            '--use-flex-shard is not supported with tensor parallelism yet'
+        assert args.expert_model_parallel_size == 1, \
+            '--use-flex-shard is not supported with expert parallelism'
+        assert not args.use_distributed_optimizer, \
+            "--use-flex-shard is not supported with MCore's distributed optimizer"
+        assert not args.overlap_param_gather, \
+            '--use-flex-shard is not supported with --overlap-param-gather'
+        assert not args.gradient_accumulation_fusion, \
+            '--use-flex-shard is not supported with gradient accumulation fusion'
+        assert args.untie_embeddings_and_output_weights, \
+            '--use-flex-shard requires --untie-embeddings-and-output-weights'
+        assert not args.fp16, '--use-flex-shard not supported with fp16 yet'
+        assert args.optimizer in ('adam', 'sgd'), \
+            '--use-flex-shard supports only --optimizer adam or sgd'
+
         if args.fp8_param_gather and is_te_min_version("2.0.0"):
             args.fp8_param_gather = False
             warn_rank_0(
@@ -3488,6 +3509,12 @@ def _add_distributed_args(parser):
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
+    group.add_argument('--use-flex-shard', action='store_true',
+                       help='Shard parameters over the data-parallel group with FlexShard '
+                       '(requires the flex_shard package).')
+    group.add_argument('--flex-shard-no-reshard-after-forward', action='store_false',
+                       dest='flex_shard_reshard_after_forward',
+                       help='Keep FlexShard unsharded parameters from forward until backward (ZeRO-2).')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
                        'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '

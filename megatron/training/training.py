@@ -48,6 +48,8 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
+    FlexShardDataParallel,
+    FlexShardDataParallelConfig,
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
 )
@@ -2694,13 +2696,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
             DP = FullyShardedDataParallel
+        elif getattr(args, "use_flex_shard", False):
+            DP = FlexShardDataParallel
         else:
             DP = DDP
 
         config = get_model_config(model[0])
 
         ddp_config = get_megatron_ddp_config(args)
-        if not getattr(args, "use_torch_fsdp2", False):
+        if not getattr(args, "use_torch_fsdp2", False) and not getattr(args, "use_flex_shard", False):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
                 ddp_config,
@@ -2856,6 +2860,11 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     if getattr(args, "use_torch_fsdp2", False):
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
         return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+    elif getattr(args, "use_flex_shard", False):
+        return FlexShardDataParallelConfig(
+            grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+            reshard_after_forward=args.flex_shard_reshard_after_forward,
+        )
     else:
         kwargs = {}
         for f in dataclasses.fields(DistributedDataParallelConfig):

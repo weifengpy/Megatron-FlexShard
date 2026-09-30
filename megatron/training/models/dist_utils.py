@@ -10,6 +10,8 @@ from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
+    FlexShardDataParallel,
+    FlexShardDataParallelConfig,
     FullyShardedDataParallel,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -305,11 +307,13 @@ def _ddp_wrap(
     elif use_torch_fsdp2:
         assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
         DP = TorchFullyShardedDataParallel
+    elif isinstance(ddp_config, FlexShardDataParallelConfig):
+        DP = FlexShardDataParallel
     else:
         DP = DistributedDataParallel
 
 
-    if not use_torch_fsdp2:
+    if not use_torch_fsdp2 and DP is not FlexShardDataParallel:
         if ddp_config.num_buckets is not None:
             num_parameters = sum(
                 [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]

@@ -56,6 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.flex_shard_data_parallel import FlexShardDataParallel
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -691,7 +692,12 @@ def _get_megatron_optimizer_based_on_param_groups(
         setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
     elif config.fp16 or config.bf16:
         optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
-        setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+        if isinstance(model_chunks[0], FlexShardDataParallel):
+            # Each gradient element lives on exactly one data-parallel rank, so grad stats
+            # are reduced over data-parallel and model-parallel ranks.
+            setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
+        else:
+            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
         assert grad_scaler is None
