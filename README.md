@@ -1,161 +1,187 @@
-<div align="center">
+# FlexShard data-parallel backend for Megatron-LM
 
-Megatron-LM and Megatron Core
-=============================
+This fork adds [FlexShard](https://github.com/meta-pytorch/flex_shard) as a Megatron data-parallel backend behind `--use-flex-shard`, alongside DDP, the distributed optimizer, torch FSDP2 and Megatron-FSDP. With the flag off, Megatron behaves exactly like upstream, so one `pretrain_gpt.py` command compares Megatron's DDP / DistributedOptimizer with FlexShard by flipping a flag.
 
-<h4>GPU-optimized library for training transformer models at scale</h4>
+Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard data-parallel backend (--use-flex-shard)".
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
-[![version](https://img.shields.io/badge/release-0.19.0-green)](https://github.com/NVIDIA/Megatron-LM/releases)
-[![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
+## Usage
 
-<div align="left">
+### Requirements
 
-## About
+- PyTorch with CUDA and NCCL. Tested with a PyTorch 2.15 dev build on CUDA 13 (flex_shard declares `torch>=2.14,<2.15`, but its test suite passes on 2.15).
+- `flex_shard` importable (`pip install --no-deps -e <flex_shard>` or `PYTHONPATH=<flex_shard>/src`). It also needs `torchao`, which is not declared: `flex_shard.custom_placements` imports the fp8 placement unconditionally.
+- TransformerEngine layers (`--transformer-impl transformer_engine`) need flex_shard with these draft PRs applied, in order:
+  - [#13](https://github.com/meta-pytorch/flex_shard/pull/13): keep `self.weight` readable in backward (TE's `RMSNorm` re-reads it).
+  - [#14](https://github.com/meta-pytorch/flex_shard/pull/14): expose unsharded params through `module._parameters` during forward (TE's operation fuser passes `op.parameters()` as autograd inputs).
+  - [#15](https://github.com/meta-pytorch/flex_shard/pull/15): re-unshard on backward-time reads with reshard-after-forward (ZeRO-3).
+  - The local spec (`--transformer-impl local`) works without them.
 
-This repository contains two components: **Megatron-LM** and **Megatron Core**.
+### Flags
 
-**Megatron-LM** is a reference example that includes Megatron Core plus pre-configured training scripts, ideal for research teams, learning distributed training, and quick experimentation.
+| Flag | Effect |
+| --- | --- |
+| `--use-flex-shard` | Shard parameters over the data-parallel group with FlexShard. Default `reshard_after_forward=True` (ZeRO-3). |
+| `--flex-shard-no-reshard-after-forward` | Keep gathered parameters from forward until backward (ZeRO-2). |
 
-**Megatron Core** is a composable library with GPU-optimized building blocks for custom training frameworks. It provides transformer building blocks, advanced parallelism strategies (TP, PP, DP, EP, and CP), mixed precision support (FP16, BF16, FP8, and FP4), and model architectures, ideal for framework developers and ML engineers building custom training pipelines.
+`validate_args` rejects combining `--use-flex-shard` with any of:
+- TP, PP or EP > 1
+- `--use-distributed-optimizer`, `--overlap-param-gather`
+- gradient-accumulation fusion (it writes `main_grad`, which only exists under Megatron DDP)
+- tied embeddings
+- fp16
+- optimizers other than Adam / SGD
+- `--use-torch-fsdp2` or `--use-megatron-fsdp`
 
-**[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
-
-## Getting Started
-
-**Install from PyPI:**
+### Example
 
 ```bash
-uv pip install megatron-core
+torchrun --nproc-per-node 8 pretrain_gpt.py \
+  --num-layers 24 --hidden-size 2048 --ffn-hidden-size 5632 --num-attention-heads 16 \
+  --seq-length 2048 --max-position-embeddings 2048 \
+  --micro-batch-size 1 --global-batch-size 8 --train-iters 60 \
+  --lr 3e-4 --min-lr 3e-5 --lr-decay-style cosine --lr-warmup-iters 5 --clip-grad 1.0 \
+  --bf16 --swiglu --normalization RMSNorm --position-embedding-type rope \
+  --untie-embeddings-and-output-weights --disable-bias-linear \
+  --transformer-impl transformer_engine --no-gradient-accumulation-fusion \
+  --mock-data --tokenizer-type NullTokenizer --vocab-size 32000 \
+  --log-throughput --timing-log-level 1 --eval-iters 0 \
+  --use-flex-shard --flex-shard-no-reshard-after-forward
 ```
 
-**Or clone and install from source:**
+For the Megatron baseline, replace the last line with `--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather`.
 
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-uv pip install -e .
-```
+Without TransformerEngine, use `--transformer-impl local` together with:
+- `--no-rope-fusion`
+- `--no-bias-swiglu-fusion`
+- `--no-masked-softmax-fusion`
+- `--no-bias-dropout-fusion`
+- `--no-persist-layer-norm`
 
-> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (for example, `MAX_JOBS=4 uv pip install -e .`).
+## Design
 
-For NVIDIA GPU Cloud (NGC) container setup and all installation options, review the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
+`FlexShardDataParallel` (`megatron/core/distributed/flex_shard_data_parallel.py`) subclasses `_BaseDataParallel`, like the torch FSDP2 wrapper.
 
-- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
-- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
-- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
-- **[Style Guide](style-guide.md)** - Python style overrides
+- **Buckets**, in forward order: the embedding, one bucket per `TransformerLayer`, any remaining parameter-owning modules (e.g. `final_layernorm`), then `output_layer`. Each bucket is one all-gather before use and one reduce-scatter after backward. Every parameter is `Shard(0)` (`per_param_placements`) over the `dp_cp` group. Buckets are split by dtype, because FlexShard requires one dtype per bucket.
+- **Reshard-after-forward** follows `FlexShardDataParallelConfig.reshard_after_forward`. The last bucket never reshards, because its backward runs immediately (like the FSDP2 root).
+- **Parameter attributes.** FlexShard replaces each parameter with a local-shard tensor. The wrapper saves Megatron's per-parameter attributes (`tensor_model_parallel`, `allreduce`, ...) before `flex_shard()` and restores them afterwards.
+- **Optimizer.** After wrapping, `module.parameters()` yields local shards, so Megatron's existing `Float16OptimizerWithFloat16Params` (Adam, fp32 main params) updates only this rank's shard. Each gradient element lives on exactly one data-parallel rank, so grad stats (norm, zero count) are reduced over WORLD (`megatron/core/optimizer/__init__.py`).
+- **Grad sync.** FlexShard reduce-scatters during backward and waits at the end of backward, so `finish_grad_sync` is a no-op. `scale_gradients` scales the local shards.
+- **Selection.** `get_megatron_ddp_config` returns a `FlexShardDataParallelConfig` when `--use-flex-shard` is set. Both `get_model()` and the ModelBuilder path that `pretrain_gpt.py` uses (`megatron/training/models/dist_utils.py:_ddp_wrap`) pick the wrapper from that config type.
+- **Process groups** come from `pg_collection.dp_cp`, with a fallback to `parallel_state` for callers that don't pass groups.
 
-# Latest News
+### Limitations
 
-- **[2026/05]** **[DeepSeek-V4 initial support](https://github.com/NVIDIA/Megatron-LM/issues/4468)** - Megatron Core's `dev` branch includes the initial DeepSeek-V4 implementation; Megatron Bridge provides [conversion, inference, and pretraining recipes](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/deepseek_v4).
-- **[2026/04]** **[Advancing Emerging Optimizers for Accelerated LLM Training with NVIDIA Megatron](https://developer.nvidia.com/blog/advancing-emerging-optimizers-for-accelerated-llm-training-with-nvidia-megatron/)** - Muon and other emerging optimizers are now supported in Megatron Core via the new **[Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers)** library.
-- **[2026/03]** **[Scalable Training of Mixture-of-Experts Models with Megatron Core](https://arxiv.org/abs/2603.07685)** - Technical report on scaling MoE training with integrated optimizations for memory, communication, and computation.
-- **[2026/03]** **[Implementing Falcon-H1 Hybrid Architecture in Megatron Core](https://developer.nvidia.com/blog/implementing-falcon-h1-hybrid-architecture-in-nvidia-megatron-core/)** - Technology Innovation Institute (TII) contributes Falcon-H1 hybrid transformer-Mamba architecture and BitNet ternary quantization support to Megatron Core.
-- **[2026/03]** **[Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4003)** - Roadmap for upcoming Megatron Core features and improvements.
-- **[2026/03]** **Deprecating Python 3.10 support:** The upcoming 0.17.0 release drops Python 3.10 support. Downstream applications must raise their lower boundary to 3.12 to stay compatible with Megatron Core.
-- **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
-- **[2025/12]** **Megatron Core development has moved to GitHub.** All development and CI now happen in the open, and community contributions are welcome.
-- **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - Early access branch with experimental features.
-- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
-- **[2025/08]** **[Mixture of Experts (MoE) Q3–Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
-- **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Megatron Core integrates advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions.
-- **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
+- **No no-sync.** Every microbatch's backward reduce-scatters, and with ZeRO-3 every microbatch also re-gathers. Gradient accumulation (GA > 1) therefore moves k times the bytes of Megatron DDP. See the [Roadmap](#roadmap).
+- **One transformer layer per bucket.** FlexShard hooks a bucket on the deepest module owning all its parameters. For a multi-layer bucket that is the `decoder.layers` ModuleList, whose forward never runs ("bucket hook did not run").
+- **Checkpoint save/load** is not wired up.
+- **`torch.compile`:** FlexShard falls back to synchronous unshard under compile, so it is not used here.
 
-[Previous News](docs/discussions/README.md#previous-news)
+## Benchmark: Megatron DDP + DistributedOptimizer vs FlexShard ZeRO-2
 
-# Project Structure
+### Method
 
-```
-Megatron-LM/
-├── megatron/
-│   ├── core/                    # Megatron Core (kernels, parallelism, building blocks)
-│   │   ├── models/              # Transformer models
-│   │   ├── transformer/         # Transformer building blocks
-│   │   ├── tensor_parallel/     # Tensor parallelism
-│   │   ├── pipeline_parallel/   # Pipeline parallelism
-│   │   ├── distributed/         # Distributed training (FSDP, DDP)
-│   │   ├── optimizer/           # Optimizers
-│   │   ├── datasets/            # Dataset loaders
-│   │   ├── inference/           # Inference engines and server
-│   │   └── export/              # Model export (example: TensorRT-LLM)
-│   ├── training/                # Training scripts
-│   ├── legacy/                  # Legacy components
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
-│   └── rl/                      # Reinforcement learning (including RLHF)
-├── examples/                    # Ready-to-use training examples
-├── tools/                       # Utility tools
-├── tests/                       # Comprehensive test suite
-└── docs/                        # Documentation
-```
+The like-for-like pair at GA = 1 is **M1** (Megatron DDP + DistributedOptimizer, ZeRO-1) vs **F2** (FlexShard ZeRO-2). Both move the same bytes per step (one reduce-scatter of grads and one all-gather of params) and hold full bf16 params during forward/backward. They differ only in scheduling and bucketing, so a gap measures implementation, not sharding strategy.
 
-# Performance Benchmarking
+| | M1: DDP + DistOpt | F2: FlexShard ZeRO-2 |
+| --- | --- | --- |
+| Comm per step | RS grads + AG params (after the optimizer, overlapped with the next forward) | AG per bucket in forward + RS per bucket in backward |
+| Optimizer | `DistributedOptimizer` (Adam, fp32 main, 1/8) | `Float16OptimizerWithFloat16Params` (Adam, fp32 main) on local 1/8 shards |
+| Grads | full bf16 grad buffer per rank | sharded |
+| Buckets | ~40M-param contiguous buckets | one per `TransformerLayer` + embedding / final norm / output |
 
-For the latest performance benchmarking results, refer to [NVIDIA Megatron Bridge Performance Summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html).
+Reference arms:
+- M0: plain DDP.
+- M2: Megatron-FSDP `optim_grads_params`, compared only with F1.
+- F1: FlexShard ZeRO-3, compared only with M2.
 
-The codebase efficiently trains models from 2B to 462B parameters across thousands of GPUs, achieving up to **47% Model FLOP Utilization (MFU)** on H100 clusters.
+Setup:
+- 8x H100 96 GB, DP = 8, TP = PP = 1.
+- Mock data, bf16 grads, MBS 1, seq 2048, lr 3e-4.
+- Timing is the median over iterations ≥ 20.
 
-![Model table](images/model_table.png)
+Shapes:
+- **S:** 24 layers, hidden 2048, ffn 5632, 16 heads (1.5B).
+- **L:** 32 layers, hidden 4096, ffn 14336, GQA 32/8 (8B). It runs with `--recompute-granularity selective` on every arm, because M1 runs out of memory without it.
 
-**Benchmark Configuration:**
+### Results (local spec, no TransformerEngine)
 
-- **Vocabulary size**: 131,072 tokens
-- **Sequence length**: 4,096 tokens
-- **Model scaling**: Varied hidden size, attention heads, and layers to achieve target parameter counts
-- **Communication optimizations**: Fine-grained overlapping with DP (`--overlap-grad-reduce`, `--overlap-param-gather`), TP (`--tp-comm-overlap`), and PP (enabled by default)
+| Shape | M1 ms/it | F2 ms/it | Δ | M1 / F2 max allocated |
+| --- | --- | --- | --- | --- |
+| S | 157.7 | 156.6 | −1% | 21.5 / 16.5 GB |
+| L | 594.9 | 538.1 | −10% | 59.4 / 33.6 GB |
 
-**Key Results:**
+- **Profile (S, rank 0, one step):** compute is the same in both arms (~117 ms). F2 exposes 45.5 ms of NCCL (AG 25.3 / RS 17.6) vs 13.0 ms for M1. F2's stalls are ~1 ms gaps before `split_with_sizes_copy_out`: each layer waits for its own all-gather, and one-bucket-ahead prefetch does not hide it.
+- **GA = 4 (feature gap, not like-for-like):** S 495.8 vs 545.3 ms (+10%); L 1824.4 vs 2006.2 ms (+10%). The extra per-microbatch cost at S (+17 ms) matches F2's exposed reduce-scatter.
+- **ZeRO-3 pair (GA = 1):** F1 vs M2 is 179.9 vs 164.1 ms (S) and 649.6 vs 533.0 ms (L), with similar memory.
+- **Correctness:**
+  - Iteration-1 loss and grad norm are bit-identical across M0/M1/M2/F1/F2 (local spec) and across M1/F1/F2 (TE spec).
+  - A 4-layer model tracks over 20 iterations (loss 2.357658 vs 2.357765).
+  - S and L diverge after ~iteration 5 in every arm, M0 vs M1 included, because lr 3e-4 is unstable for them.
 
-- **6,144 H100 GPUs**: Successfully benchmarked 462B parameter model training.
-- **Superlinear scaling**: MFU increases from 41% to 47–48% with model size.
-- **End-to-end measurement**: Throughputs include all operations (data loading, optimizer steps, communication, and logging).
-- **Production ready**: Full training pipeline with checkpointing and fault tolerance.
-- *Note: Performance results measured without training to convergence*
+TransformerEngine runs work (M1, F1, F2), but no trustworthy TE timings yet: the shared machine had other jobs on some GPUs, which put ranks out of step.
 
-## Weak Scaling Results
+### Remaining benchmark work
 
-The weak scaled results show superlinear scaling (MFU increases from 41% for the smallest model considered to 47–48% for the largest models); this is because larger GEMMs have higher arithmetic intensity and are consequently more efficient to execute.
+1. Profile M1 vs F2 at L (M1 is slower than both sharded arms there).
+2. Loss parity at a stable lr, and a parameter-equality check after N steps.
+3. M1 `--ddp-bucket-size` 20/40/80M, MBS 2, and nccl-tests at both bucket sizes.
+4. TE timings at seq 4096 on a quiet machine.
 
-![Weak scaling](images/weak_scaling.png)
+## Roadmap
 
-## Strong Scaling Results
+### No-sync gradient accumulation (FlexShard)
 
-This test strong scales the standard GPT-3 model (slightly more than 175 billion parameters due to larger vocabulary size) from 96 H100 GPUs to 4,608 GPUs, using the same batch size of 1,152 sequences throughout. Communication becomes more exposed at larger scale, leading to a reduction in MFU from 47% to 42%.
+Closing the GA > 1 gap needs no-sync (one reduce-scatter per step), plus keeping full params between microbatches (one all-gather per step, like FSDP2's `set_reshard_after_backward(False)`).
 
-![Strong scaling](images/strong_scaling.png)
+- **FSDP2:** `set_requires_gradient_sync(False)` skips the reduce-scatter in `post_backward`. Autograd then accumulates into the persistent unsharded parameter's `.grad`.
+- **FlexShard** needs an explicit per-bucket accumulator, because its unsharded params are outputs of the `_BucketUnshard` autograd function, not leaves. Full grads arrive in `_BucketUnshard.backward` and are reduce-scattered immediately. Planned design:
+  - **API:** `FlexShardModule.set_requires_gradient_sync(bool, buckets=None)` and a `no_sync()` context manager. Optional `BucketSpec(accumulate_dtype=...)` for fp32 accumulation.
+  - **No-sync microbatches:** grads `add_` into the accumulator (the first microbatch keeps the grad tensor without copying).
+  - **Syncing microbatch:** adds into the accumulator, then reduce-scatters through the existing path.
+  - **Unused params:** an end-of-backward callback reduces buckets that hold accumulated grads but got none in the last microbatch.
+  - **Phase 2:** accumulate in the flat reduce-scatter layout, so the last microbatch skips the copy-in (like Megatron's contiguous grad buffer).
+  - **Memory:** full unsharded grads between microbatches (S: 3 GB bf16, L: 16 GB), which is Megatron DDP's cost. Hence opt-in, per bucket.
+  - **Megatron wiring:** `FlexShardDataParallel.no_sync()`, add the wrapper to `no_sync_func` setup in `training.py`, and a `--flex-shard-no-sync` flag.
+  - **Expected gain:** F2 at GA = 4 drops from ~545 to ~495 ms (M1 parity).
+- **Alternative:** an FSDP2-style persistent unsharded parameter, with `resize_(0)` storage on reshard, would provide no-sync through autograd and cover all backward-time parameter reads. It's a larger redesign of FlexShard's core.
 
-# Roadmaps
+### Muon: Megatron layer-wise Muon (M3) vs FlexShard ZeRO-2 + DistMuon (F3)
 
-- **[2026 Q2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4997)**
-- **[2026 Q2 MoE-Specific Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4815)** [`dev` branch first developments]
+| | M3: Megatron layer-wise Muon | F3: FlexShard ZeRO-2 + DistMuon |
+| --- | --- | --- |
+| Wiring | `--optimizer muon --use-distributed-optimizer --muon-scalar-optimizer adam` → `LayerWiseDistributedOptimizer` | owned buckets from flex_shard's `materialize_dist_muon_buckets` + `build_local_dist_muon(DistMuon)` (torchtitan `torchtitan/distributed/flex_shard/dist_muon.py`) |
+| Ownership | whole matrices, LPT bin-packing per bucket | whole matrices / block groups, `assign_matrices` |
+| Comm per step | RS to owners + AG params | AG in forward + RS to owners |
+| Optimizer comm | none | none (storage == compute layout) |
+| Uneven shards | padded to the largest owner | padded to the largest owner |
+| Non-matrix params | Adam | Adam on `Shard(0)` buckets |
 
-# Resources
+- M3 reduce-scatters to owners by default (`use_layer_wise_param_layout=True`); the class docstring's all-reduce flow is the legacy path. It needs `emerging_optimizers` `v0.3.0`.
+- M1 and F2 serve as references, so that (M3 − M1) vs (F3 − F2) isolates the cost of switching from Adam to Muon in each stack.
 
-## Getting Help
+Wiring F3:
+1. Pick Muon params with Megatron's `is_managed_by_layer_wise_optimizer` (qkv, proj, fc1, fc2 weights), so both stacks use the same set.
+2. Add a `--flex-shard-dist-muon` mode: `assign_matrices` → owned buckets per layer, with non-matrix params on `Shard(0)` buckets.
+3. Optimizer: a `ChainedOptimizer` of DistMuon on fp32 main copies of the owned shards, plus Megatron Adam on the rest. Global grad norm over WORLD. Handle ranks that own no matrices.
+4. Relax the `--use-flex-shard` optimizer restriction.
 
-- 📖 **[Documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** - Official guides and API reference
-- 🐛 **[Issues](https://github.com/NVIDIA/Megatron-LM/issues)** - Bug reports and feature requests
+Parity gate before timing:
 
-## Contributing
+| Knob | Megatron | DistMuon |
+| --- | --- | --- |
+| NS coefficients / steps | `--muon-coefficient-type`, `--muon-num-ns-steps` | `ns_coefficients` (3.4445, −4.7750, 2.0315), `ns_steps=5` |
+| NS precision | `--muon-fp32-matmul-prec` | bf16 |
+| Update scale | `--muon-scale-mode spectral` | `adjust_lr_fn` (`original` √max(1, r/c), `match_rms_adamw`, `spectral_unclamped`) |
+| Momentum / weight decay | `--muon-momentum`, `--muon-nesterov`, confirm decoupled WD | 0.95, Nesterov, decoupled |
+| QKV / fc1 split | per-head split by default (`--muon-no-split-qkv`) | whole matrix or `BlockShard`; start with no split on both sides |
 
-Contributions are welcome. Ways to contribute:
+Checks:
+- A single-matrix update agrees within ~2e-2.
+- M3 vs F3 loss curves agree over 50 iterations at a stable lr.
+- M1 vs M3 curves differ, confirming Muon is active.
 
-- 🐛 **Report bugs** - Help improve reliability
-- 💡 **Suggest features** - Shape the future of Megatron Core
-- 📝 **Improve docs** - Make Megatron Core more accessible
-- 🔧 **Submit PRs** - Contribute code improvements
-
-**→ [Contributing Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)**
-
-## Citation
-
-If you use Megatron in your research or project, use the following citation:
-
-```bibtex
-@article{megatron-lm,
-  title={Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism},
-  author={Shoeybi, Mohammad and Patwary, Mostofa and Puri, Raul and LeGresley, Patrick and Casper, Jared and Catanzaro, Bryan},
-  journal={arXiv preprint arXiv:1909.08053},
-  year={2019}
-}
-```
+Risks:
+- Coarse ownership at DP = 8 (mitigate with block groups).
+- DistMuon requires a grad for every configured param.
+- Megatron's interleaved per-group QKV layout.
+- Keep `overlap_param_gather_with_optimizer_step` off.
