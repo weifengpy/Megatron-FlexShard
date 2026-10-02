@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import torch
@@ -36,14 +37,14 @@ class FlexShardDataParallel(_BaseDataParallel):
     Each bucket is one all-gather before use and one reduce-scatter after backward over the
     data-parallel group, with every parameter sharded along dim 0. Buckets follow forward
     order: the embedding, one bucket per TransformerLayer, any remaining parameter-owning
-    modules (e.g. the final layernorm), and the output layer. FlexShard hooks each bucket on
-    the deepest module owning all of its parameters, so a bucket spanning several layers
-    would hook their ModuleList, whose forward never runs.
+    modules (e.g. the final layernorm), and the output layer.
 
     After wrapping, ``module.parameters()`` yields local shards as plain tensors, so a
     non-distributed Megatron optimizer updates only this rank's shard. Gradients are reduced
     during backward and waited on at the end of backward, so ``finish_grad_sync`` has nothing
-    left to do. FlexShard has no no-sync mode: every microbatch's backward reduce-scatters.
+    left to do. Inside ``no_sync()`` (Megatron's ``no_sync_func``, wired with
+    ``ddp_config.no_sync``), backwards skip the reduce-scatter and accumulate full gradients,
+    in fp32 with ``grad_reduce_in_fp32``; the last microbatch's backward reduce-scatters them.
 
     Args:
         config: Transformer config object.
@@ -104,6 +105,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             for i, fqns in enumerate(bucket_fqns)
         ]
         flex_shard(self.module, buckets=self.buckets)
+        self.module.set_reshard_after_backward(ddp_config.reshard_after_backward)
 
         for name, param in self.module.named_parameters():
             for attr_name, attr_value in custom_attrs.get(name, {}).items():
@@ -115,6 +117,8 @@ class FlexShardDataParallel(_BaseDataParallel):
             logging.INFO,
             f"FlexShard: {len(self.buckets)} buckets over {self.device_mesh.size()} ranks, "
             f"reshard_after_forward={ddp_config.reshard_after_forward}, "
+            f"no_sync={ddp_config.no_sync}, "
+            f"reshard_after_backward={ddp_config.reshard_after_backward}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
 
@@ -147,6 +151,18 @@ class FlexShardDataParallel(_BaseDataParallel):
                 by_dtype.setdefault(params[fqn].dtype, []).append(fqn)
             split_buckets.extend(by_dtype.values())
         return split_buckets
+
+    @contextmanager
+    def no_sync(self):
+        """
+        Context manager that turns off gradient synchronization: backwards inside it
+        accumulate full gradients without reduce-scatter.
+        """
+        self.module.set_requires_gradient_sync(False)
+        try:
+            yield
+        finally:
+            self.module.set_requires_gradient_sync(True)
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale all local gradient shards by `scaling_factor`."""

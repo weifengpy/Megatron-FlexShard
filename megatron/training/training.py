@@ -2864,6 +2864,8 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         return FlexShardDataParallelConfig(
             grad_reduce_in_fp32=args.accumulate_allreduce_grads_in_fp32,
             reshard_after_forward=args.flex_shard_reshard_after_forward,
+            no_sync=args.flex_shard_no_sync,
+            reshard_after_backward=args.flex_shard_reshard_after_backward,
         )
     else:
         kwargs = {}
@@ -4825,9 +4827,12 @@ def train(
     # know which backward that is. Without it every backward finalizes that axis, the
     # accumulation buffer is dropped, and only the last microbatch's gradient survives.
     # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
-    # so without that flag there is nothing for no_sync to suppress.
-    if isinstance(model[0], FullyShardedDataParallelV2) or (
-        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+    # so without that flag there is nothing for no_sync to suppress. FlexShard also reduces
+    # during backward; with --flex-shard-no-sync, no_sync defers that to the last microbatch.
+    if (
+        isinstance(model[0], FullyShardedDataParallelV2)
+        or (isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce)
+        or (isinstance(model[0], FlexShardDataParallel) and args.flex_shard_no_sync)
     ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '

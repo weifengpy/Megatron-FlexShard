@@ -1088,6 +1088,8 @@ def validate_args(args, defaults={}):
         assert not args.fp16, '--use-flex-shard not supported with fp16 yet'
         assert args.optimizer in ('adam', 'sgd'), \
             '--use-flex-shard supports only --optimizer adam or sgd'
+        assert args.flex_shard_no_sync or args.flex_shard_reshard_after_backward, \
+            '--flex-shard-no-reshard-after-backward requires --flex-shard-no-sync'
 
         if args.fp8_param_gather and is_te_min_version("2.0.0"):
             args.fp8_param_gather = False
@@ -3515,6 +3517,16 @@ def _add_distributed_args(parser):
     group.add_argument('--flex-shard-no-reshard-after-forward', action='store_false',
                        dest='flex_shard_reshard_after_forward',
                        help='Keep FlexShard unsharded parameters from forward until backward (ZeRO-2).')
+    group.add_argument('--flex-shard-no-sync', action='store_true',
+                       help='Reduce-scatter FlexShard gradients only in the last microbatch. '
+                       'Earlier microbatches accumulate full gradients (fp32 with '
+                       '--accumulate-allreduce-grads-in-fp32), which costs one full '
+                       'gradient copy of memory.')
+    group.add_argument('--flex-shard-no-reshard-after-backward', action='store_false',
+                       dest='flex_shard_reshard_after_backward',
+                       help='With --flex-shard-no-sync, keep FlexShard unsharded parameters '
+                       'between microbatches, so only the first microbatch all-gathers them '
+                       '(without reshard-after-forward).')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
                        'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '

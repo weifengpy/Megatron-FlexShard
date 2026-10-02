@@ -14,3 +14,16 @@ class FlexShardDataParallelConfig(DistributedDataParallelConfig):
     backward (ZeRO-3). If False, keep them until backward (ZeRO-2). The last bucket in forward
     order never reshards, since its backward runs immediately.
     """
+
+    no_sync: bool = False
+    """Reduce-scatter gradients only in the last microbatch's backward. Earlier microbatches
+    run under no_sync_func and accumulate full gradients (in fp32 with grad_reduce_in_fp32),
+    which costs one full gradient copy of memory.
+    """
+
+    reshard_after_backward: bool = True
+    """Free each bucket's unsharded parameters after a backward without gradient sync. If
+    False, keep them for the next microbatch, which then skips the all-gather: with no_sync
+    and without reshard_after_forward, one all-gather and one reduce-scatter per bucket per
+    step. The last microbatch's backward always reshards.
+    """
