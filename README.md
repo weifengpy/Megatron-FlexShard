@@ -10,7 +10,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 
 - PyTorch with CUDA and NCCL. Tested with a PyTorch 2.15 dev build on CUDA 13 (flex_shard declares `torch>=2.14,<2.15`, but its test suite passes on 2.15).
 - `flex_shard` importable (`pip install --no-deps -e <flex_shard>` or `PYTHONPATH=<flex_shard>/src`). It also needs `torchao`, which is not declared: `flex_shard.custom_placements` imports the fp8 placement unconditionally.
-- TransformerEngine layers (`--transformer-impl transformer_engine`) need flex_shard `main` at or after [#16](https://github.com/meta-pytorch/flex_shard/pull/16) (persistent unsharded parameters, which superseded drafts #13–#15). `--flex-shard-no-sync` and `--flex-shard-no-reshard-after-backward` need `main` at or after [#18](https://github.com/meta-pytorch/flex_shard/pull/18) (no-sync gradient accumulation).
+- TransformerEngine layers (`--transformer-impl transformer_engine`) need flex_shard `main` at or after [#16](https://github.com/meta-pytorch/flex_shard/pull/16) (persistent unsharded parameters, which superseded drafts #13–#15). `--flex-shard-no-sync` and `--flex-shard-no-reshard-after-backward` need `main` at or after [#18](https://github.com/meta-pytorch/flex_shard/pull/18) (no-sync gradient accumulation). fp32 local-shard gradients need [#20](https://github.com/meta-pytorch/flex_shard/pull/20) (per-parameter `grad_dtype`), and [#21](https://github.com/meta-pytorch/flex_shard/pull/21) keeps their casts as cheap as before; without #20, local-shard gradients stay bf16.
 
 ### Flags
 
@@ -62,7 +62,7 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 - **Buckets**, in forward order: the embedding, one bucket per `TransformerLayer`, any remaining parameter-owning modules (e.g. `final_layernorm`), then `output_layer`. Each bucket is one all-gather before use and one reduce-scatter after backward. Every parameter is `Shard(0)` (`per_param_placements`) over the `dp_cp` group. Buckets are split by dtype, because FlexShard requires one dtype per bucket.
 - **Reshard-after-forward** follows `FlexShardDataParallelConfig.reshard_after_forward`. The last bucket never reshards, because its backward runs immediately (like the FSDP2 root).
 - **Parameter attributes.** FlexShard replaces each parameter with a local-shard tensor. The wrapper saves Megatron's per-parameter attributes (`tensor_model_parallel`, `allreduce`, ...) before `flex_shard()` and restores them afterwards.
-- **Optimizer.** After wrapping, `module.parameters()` yields local shards, so Megatron's existing `Float16OptimizerWithFloat16Params` (Adam, fp32 main params) updates only this rank's shard. Each gradient element lives on exactly one data-parallel rank, so grad stats (norm, zero count) are reduced over WORLD (`megatron/core/optimizer/__init__.py`).
+- **Optimizer.** After wrapping, `module.parameters()` yields local shards, so Megatron's existing `Float16OptimizerWithFloat16Params` (Adam, fp32 main params) updates only this rank's shard. With `--accumulate-allreduce-grads-in-fp32` (the bf16 default), each bf16 parameter gets `grad_dtype=torch.float32` before `flex_shard()`, so FlexShard stores fp32 local-shard gradients, as the distributed optimizer keeps them, and the optimizer uses them as its main gradients without a copy. Each gradient element lives on exactly one data-parallel rank, so grad stats (norm, zero count) are reduced over WORLD (`megatron/core/optimizer/__init__.py`).
 - **Grad sync.** FlexShard reduce-scatters during backward and waits at the end of backward, so `finish_grad_sync` is a no-op. `scale_gradients` scales the local shards.
 - **No-sync.** With `--flex-shard-no-sync`, `train()` puts `FlexShardDataParallel.no_sync` in `no_sync_func`. It turns FlexShard's `set_requires_gradient_sync` off on entry and back on at exit, as Megatron DDP's `no_sync()` does with `is_last_microbatch`; FlexShard, like FSDP2, has no context manager of its own. Backwards of all but the last microbatch keep full gradients on FlexShard's persistent unsharded parameters, and autograd accumulates into them. The last microbatch's backward reduce-scatters them, including buckets it did not use. FlexShard always reshards after that syncing backward, so `--flex-shard-no-reshard-after-backward` cannot leave stale parameters after the optimizer step.
 - **Selection.** `get_megatron_ddp_config` returns a `FlexShardDataParallelConfig` when `--use-flex-shard` is set. Both `get_model()` and the ModelBuilder path that `pretrain_gpt.py` uses (`megatron/training/models/dist_utils.py:_ddp_wrap`) pick the wrapper from that config type.
@@ -70,7 +70,6 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 
 ### Limitations
 
-- **Sharded gradients are bf16.** FlexShard reduce-scatters in fp32 but stores each local shard's gradient in the parameter dtype, so the fp32 main params get bf16 gradients. The distributed optimizer keeps them in fp32.
 - **Checkpoint save/load** is not wired up.
 - **`torch.compile`:** FlexShard falls back to synchronous unshard under compile, so it is not used here.
 
