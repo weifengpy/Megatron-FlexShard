@@ -243,7 +243,7 @@ Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `resh
 ## Roadmap
 
 After Phases A and B, in order of benchmarking value:
-1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard shards each TP rank's local params over that rank's data-parallel group, so the code change may be small. The work:
+1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard shards each TP rank's local params over that rank's data-parallel group, so the code change may be small. [FLEXSHARD_TP_PLAN.md](FLEXSHARD_TP_PLAN.md) has the full plan. The work:
    - Lift the `validate_args` restriction.
    - Check the grad-norm reduction. It sums over WORLD and relies on Megatron's existing filter, which counts params replicated across TP ranks (e.g. layer norms) only on TP rank 0. FlexShard's wrapper restores the `tensor_model_parallel` attributes that filter reads.
    - Check the sequence-parallel layer-norm grad all-reduce. `finalize_model_grads` runs it on FlexShard's local-shard grads (`param.grad`, since there is no `main_grad`).
