@@ -39,6 +39,9 @@ class FlexShardDataParallel(_BaseDataParallel):
     order: the embedding, one bucket per TransformerLayer, any remaining parameter-owning
     modules (e.g. the final layernorm), and the output layer.
 
+    With tensor parallelism, each rank shards its TP slices over its data-parallel group,
+    which excludes its TP peers, so the model's own TP communication is unchanged.
+
     After wrapping, ``module.parameters()`` yields local shards as plain tensors, so a
     non-distributed Megatron optimizer updates only this rank's shard. Gradients are reduced
     during backward and waited on at the end of backward, so ``finish_grad_sync`` has nothing

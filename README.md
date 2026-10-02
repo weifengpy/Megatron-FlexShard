@@ -22,7 +22,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 | `--flex-shard-no-reshard-after-backward` | With `--flex-shard-no-sync`, keep gathered parameters between microbatches, so only the first microbatch all-gathers (without reshard-after-forward). |
 
 `validate_args` rejects combining `--use-flex-shard` with any of:
-- TP, PP or EP > 1
+- PP or EP > 1
 - `--use-distributed-optimizer`, `--overlap-param-gather`
 - gradient-accumulation fusion (it writes `main_grad`, which only exists under Megatron DDP)
 - tied embeddings
@@ -67,6 +67,7 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 - **No-sync.** With `--flex-shard-no-sync`, `train()` puts `FlexShardDataParallel.no_sync` in `no_sync_func`. It turns FlexShard's `set_requires_gradient_sync` off on entry and back on at exit, as Megatron DDP's `no_sync()` does with `is_last_microbatch`; FlexShard, like FSDP2, has no context manager of its own. Backwards of all but the last microbatch keep full gradients on FlexShard's persistent unsharded parameters, and autograd accumulates into them. The last microbatch's backward reduce-scatters them, including buckets it did not use. FlexShard always reshards after that syncing backward, so `--flex-shard-no-reshard-after-backward` cannot leave stale parameters after the optimizer step.
 - **Selection.** `get_megatron_ddp_config` returns a `FlexShardDataParallelConfig` when `--use-flex-shard` is set. Both `get_model()` and the ModelBuilder path that `pretrain_gpt.py` uses (`megatron/training/models/dist_utils.py:_ddp_wrap`) pick the wrapper from that config type.
 - **Process groups** come from `pg_collection.dp_cp`, with a fallback to `parallel_state` for callers that don't pass groups.
+- **Tensor parallelism.** With TP, each rank's parameters are its TP slices, and FlexShard shards them over the rank's `dp_cp` group, which excludes its TP peers. Megatron's layers keep their own TP communication: column- and row-parallel linears, sequence-parallel all-gathers and reduce-scatters, and TransformerEngine's `--tp-comm-overlap`. The restored `tensor_model_parallel` attributes keep the grad-norm filter (`param_is_not_tensor_parallel_duplicate`) counting TP-replicated parameters, such as layer norms, once. `finalize_model_grads` all-reduces sequence-parallel and `--qk-layernorm` layer-norm gradients over TP on `param.grad`, FlexShard's local-shard gradient, since there is no `main_grad`. On Hopper, Megatron requires `CUDA_DEVICE_MAX_CONNECTIONS=1` with TP, and FlexShard runs with it.
 
 ### Limitations
 
