@@ -10,7 +10,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 
 - PyTorch with CUDA and NCCL. Tested with a PyTorch 2.15 dev build on CUDA 13 (flex_shard declares `torch>=2.14,<2.15`, but its test suite passes on 2.15).
 - `flex_shard` importable (`pip install --no-deps -e <flex_shard>` or `PYTHONPATH=<flex_shard>/src`). It also needs `torchao`, which is not declared: `flex_shard.custom_placements` imports the fp8 placement unconditionally.
-- TransformerEngine layers (`--transformer-impl transformer_engine`) need flex_shard `main` at or after [#16](https://github.com/meta-pytorch/flex_shard/pull/16) (persistent unsharded parameters, which superseded drafts #13–#15). `--flex-shard-no-sync` needs [#18](https://github.com/meta-pytorch/flex_shard/pull/18).
+- TransformerEngine layers (`--transformer-impl transformer_engine`) need flex_shard `main` at or after [#16](https://github.com/meta-pytorch/flex_shard/pull/16) (persistent unsharded parameters, which superseded drafts #13–#15). `--flex-shard-no-sync` and `--flex-shard-no-reshard-after-backward` need `main` at or after [#18](https://github.com/meta-pytorch/flex_shard/pull/18) (no-sync gradient accumulation).
 
 ### Flags
 
