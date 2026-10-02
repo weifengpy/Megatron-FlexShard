@@ -243,10 +243,11 @@ Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `resh
 ## Roadmap
 
 After Phases A and B, in order of benchmarking value:
-1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard can already describe TP-sharded params through its outer layout. The work:
+1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard shards each TP rank's local params over that rank's data-parallel group, so the code change may be small. The work:
    - Lift the `validate_args` restriction.
-   - Fix the grad-norm and clipping reductions. Today they sum over WORLD, since each grad element lives on exactly one DP rank, so params replicated across TP ranks (e.g. layer norms) would be counted twice.
-   - Check the sequence-parallel layer-norm grad all-reduce.
+   - Check the grad-norm reduction. It sums over WORLD and relies on Megatron's existing filter, which counts params replicated across TP ranks (e.g. layer norms) only on TP rank 0. FlexShard's wrapper restores the `tensor_model_parallel` attributes that filter reads.
+   - Check the sequence-parallel layer-norm grad all-reduce. `finalize_model_grads` runs it on FlexShard's local-shard grads (`param.grad`, since there is no `main_grad`).
+   - Compare loss and grad norm with Megatron at TP 2 × DP 2 and TP 2 × DP 4, with and without sequence parallelism.
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` rejects `--gradient-accumulation-fusion`, so the benchmark turns it off on both sides. The comparison therefore leaves out an optimization Megatron users normally run. The work:
    - Give FlexShard's unsharded params an fp32 `main_grad` that TransformerEngine accumulates into.
    - Reduce-scatter from that buffer.
