@@ -1079,8 +1079,6 @@ def validate_args(args, defaults={}):
             "--use-flex-shard is not supported with MCore's distributed optimizer"
         assert not args.overlap_param_gather, \
             '--use-flex-shard is not supported with --overlap-param-gather'
-        assert not args.gradient_accumulation_fusion, \
-            '--use-flex-shard is not supported with gradient accumulation fusion'
         assert args.untie_embeddings_and_output_weights, \
             '--use-flex-shard requires --untie-embeddings-and-output-weights'
         assert not args.fp16, '--use-flex-shard not supported with fp16 yet'

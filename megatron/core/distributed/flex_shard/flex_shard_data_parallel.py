@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import torch
 from torch.distributed import ProcessGroup
@@ -56,6 +56,12 @@ class FlexShardDataParallel(_BaseDataParallel):
     With ``grad_reduce_in_fp32``, local-shard gradients are fp32 too, as the distributed
     optimizer keeps them.
 
+    With gradient accumulation fusion, TransformerEngine's and Megatron's linear layers add
+    weight gradients straight into ``param.main_grad`` and give autograd none. Buckets with
+    such layers set FlexShard's ``BucketSpec.main_grad``, which aliases each gathered
+    parameter's gradient as ``main_grad`` before the bucket's backward, so the fused GEMMs
+    accumulate into the gradient FlexShard reduce-scatters, across microbatches with no_sync.
+
     Args:
         config: Transformer config object.
         ddp_config: FlexShardDataParallelConfig object.
@@ -102,6 +108,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             reduce_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else None
         )
         bucket_fqns = self._build_bucket_fqns()
+        fused_fqns = self._fused_wgrad_fqns() if config.gradient_accumulation_fusion else set()
         self.buckets = [
             BucketSpec(
                 fqns,
@@ -111,6 +118,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 reshard_after_forward=(
                     ddp_config.reshard_after_forward and i < len(bucket_fqns) - 1
                 ),
+                main_grad=any(fqn in fused_fqns for fqn in fqns),
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
@@ -136,8 +144,19 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"reshard_after_forward={ddp_config.reshard_after_forward}, "
             f"no_sync={ddp_config.no_sync}, "
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
+            f"main_grad buckets={sum(bucket.main_grad for bucket in self.buckets)}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
+
+    def _fused_wgrad_fqns(self) -> Set[str]:
+        """FQNs of parameters whose modules add weight gradients into ``main_grad``."""
+        return {
+            f"{name}.{param_name}" if name else param_name
+            for name, submodule in self.module.named_modules()
+            if getattr(submodule, "fuse_wgrad_accumulation", False)
+            or getattr(submodule, "gradient_accumulation_fusion", False)
+            for param_name, _ in submodule.named_parameters(recurse=False)
+        }
 
     def _build_bucket_fqns(self) -> List[List[str]]:
         """Group parameter FQNs into buckets in forward (module registration) order."""
