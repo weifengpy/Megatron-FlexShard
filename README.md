@@ -247,10 +247,19 @@ After Phases A and B, in order of benchmarking value:
    - Lift the `validate_args` restriction.
    - Fix the grad-norm and clipping reductions. Today they sum over WORLD, since each grad element lives on exactly one DP rank, so params replicated across TP ranks (e.g. layer norms) would be counted twice.
    - Check the sequence-parallel layer-norm grad all-reduce.
-2. **Expert parallelism (MoE, Megatron vs FlexShard).**
+2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` rejects `--gradient-accumulation-fusion`, so the benchmark turns it off on both sides. The comparison therefore leaves out an optimization Megatron users normally run. The work:
+   - Give FlexShard's unsharded params an fp32 `main_grad` that TransformerEngine accumulates into.
+   - Reduce-scatter from that buffer.
+3. **Tied embeddings.** `--use-flex-shard` requires `--untie-embeddings-and-output-weights`. This may be small:
+   - Keep the embedding bucket gathered through backward, so the output layer reads the gathered weight.
+   - Check that the grads from both uses accumulate before the reduce-scatter.
+4. **Expert parallelism (MoE, Megatron vs FlexShard).**
    - Put expert params in buckets over the expert data-parallel group. FlexShard supports one mesh per bucket, as in its MoE example.
    - Dense params stay on the DP group, and the token dispatcher is untouched.
    - Move expert parallelism ahead of tensor parallelism if MoE is the main target.
-3. **Pipeline parallelism.** `--flex-shard-no-sync` already follows the grad-sync enable/disable calls in Megatron's pipeline schedules.
-4. **Distributed checkpoint save/load** for FlexShard shards and their optimizer state. Benchmarks don't save or load, but real training runs need it. flex_shard `426e2bf` adds DCP metadata for model tensors.
-5. **ZeRO-3: FlexShard with reshard-after-forward vs Megatron-FSDP,** only for models that don't fit with full params resident. The numbers above for those two setups predate flex_shard #16.
+5. **Pipeline parallelism.** `--flex-shard-no-sync` already follows the grad-sync enable/disable calls in Megatron's pipeline schedules.
+6. **FP8 parameter all-gather.** `--use-flex-shard` switches `--fp8-param-gather` off with a warning, so FlexShard all-gathers bf16. The fix is to wire in FlexShard's own fp8 all-gather placement.
+7. **Real training runs.**
+   - **Distributed checkpoint save/load** for FlexShard shards and their optimizer state. Benchmarks don't save or load. flex_shard `426e2bf` adds DCP metadata for model tensors.
+   - **Evaluation** (`--eval-iters > 0`) is untested, since every benchmark ran with evaluation off.
+8. **ZeRO-3: FlexShard with reshard-after-forward vs Megatron-FSDP,** only for models that don't fit with full params resident. The numbers above for those two setups predate flex_shard #16.
