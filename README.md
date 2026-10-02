@@ -73,27 +73,46 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 - **Checkpoint save/load** is not wired up.
 - **`torch.compile`:** FlexShard falls back to synchronous unshard under compile, so it is not used here.
 
-## Benchmark: Megatron DDP + DistributedOptimizer vs FlexShard ZeRO-2
+## Benchmark: Megatron DDP + DistributedOptimizer vs FlexShard (`reshard_after_forward=False`)
+
+The goal is an apples-to-apples comparison between Megatron's data-parallel baseline and FlexShard configured to behave like it. AdamW comes first (Phase A), then Muon (Phase B). The [Plan](#plan) lists the steps; the results so far come first.
 
 ### Method
 
-The like-for-like pair at GA = 1 is **M1** (Megatron DDP + DistributedOptimizer, ZeRO-1) vs **F2** (FlexShard ZeRO-2). Both move the same bytes per step (one reduce-scatter of grads and one all-gather of params) and hold full bf16 params during forward/backward. They differ only in scheduling and bucketing, so a gap measures implementation, not sharding strategy.
+The baseline is **M1**: Megatron DDP + DistributedOptimizer (ZeRO-1).
+- It keeps full bf16 params during forward and backward.
+- It shards the optimizer state.
+- Per step, it reduce-scatters the gradients once and all-gathers the params once.
 
-| | M1: DDP + DistOpt | F2: FlexShard ZeRO-2 |
+**F2** is FlexShard with `reshard_after_forward=False` (ZeRO-2).
+- It also keeps full bf16 params during forward and backward.
+- With gradient accumulation, `--flex-shard-no-sync --flex-shard-no-reshard-after-backward` makes it move the same bytes per step as M1.
+
+A gap between M1 and F2 therefore measures the implementation (scheduling and bucketing), not the sharding strategy.
+
+| | M1: DDP + DistOpt | F2: FlexShard, `reshard_after_forward=False` |
 | --- | --- | --- |
-| Comm per step | RS grads + AG params (after the optimizer, overlapped with the next forward) | AG per bucket in forward + RS per bucket in backward |
-| Optimizer | `DistributedOptimizer` (Adam, fp32 main, 1/8) | `Float16OptimizerWithFloat16Params` (Adam, fp32 main) on local 1/8 shards |
-| Grads | full bf16 grad buffer per rank | sharded |
+| Flags | `--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather` | `--use-flex-shard --flex-shard-no-reshard-after-forward`, plus `--flex-shard-no-sync --flex-shard-no-reshard-after-backward` with gradient accumulation |
+| Comm per step | RS grads + AG params (after the optimizer, overlapped with the next forward) | AG per bucket in the first forward + RS per bucket in the last backward |
+| Optimizer | `DistributedOptimizer` (Adam, fp32 main params, 1/DP) | `Float16OptimizerWithFloat16Params` (Adam, fp32 main params) on local 1/DP shards |
+| Grads | persistent full fp32 grad buffer, reduce-scattered to fp32 shards | fp32 local-shard grads, plus full fp32 grads between microbatches only |
 | Buckets | ~40M-param contiguous buckets | one per `TransformerLayer` + embedding / final norm / output |
 
-Reference arms:
-- M0: plain DDP.
-- M2: Megatron-FSDP `optim_grads_params`, compared only with F1.
-- F1: FlexShard ZeRO-3, compared only with M2.
+Both arms match in:
+- the model, data and seed;
+- bf16 params, fp32 grads and fp32 main params;
+- Adam with decoupled weight decay and global-norm clipping;
+- gradient accumulation through `no_sync_func`.
+
+FlexShard's fp32 shard grads need flex_shard #20 (see [Requirements](#requirements)).
+
+Reference arms (not part of the goal):
+- **M0:** plain DDP, to show what the distributed optimizer adds.
+- **F1** (FlexShard ZeRO-3, `reshard_after_forward=True`) and **M2** (Megatron-FSDP `optim_grads_params`). These trade communication for memory that M1 doesn't save, so they are compared only with each other (see the [Roadmap](#roadmap)).
 
 Setup:
 - 8x H100 96 GB, DP = 8, TP = PP = 1.
-- Mock data, bf16 grads, MBS 1, seq 2048, lr 3e-4.
+- Mock data, bf16 params, MBS 1, seq 2048, lr 3e-4.
 - Timing is the median over iterations ≥ 20.
 
 Shapes:
@@ -101,6 +120,8 @@ Shapes:
 - **L:** 32 layers, hidden 4096, ffn 14336, GQA 32/8 (8B). It runs with `--recompute-granularity selective` on every arm, because M1 runs out of memory without it.
 
 ### Results (local spec, no TransformerEngine)
+
+These were measured with FlexShard before flex_shard #16 and with bf16 FlexShard shard grads. Phase A re-measures them.
 
 | Shape | M1 ms/it | F2 ms/it | Δ | M1 / F2 max allocated |
 | --- | --- | --- | --- | --- |
@@ -142,16 +163,28 @@ Arms:
 - **Memory:** no-sync adds about 4.5 GB at the peak, for the full fp32 gradients it keeps between microbatches. Keeping parameters adds nothing at the peak. F2 +ns+keep uses 0.7 GB more than M1.
 - **Correctness:** iteration-5 loss and grad norm agree across all arms within run-to-run noise. For example, at GBS 8: M1 10.09253 / 61.682, F2 +ns 10.09292 / 61.558, F2 +ns+keep 10.09299 / 61.576.
 
-### Remaining benchmark work
+### Plan
 
-1. Profile M1 vs F2 at L (M1 is slower than both sharded arms there).
-2. Loss parity at a stable lr, and a parameter-equality check after N steps.
-3. M1 `--ddp-bucket-size` 20/40/80M, MBS 2, and nccl-tests at both bucket sizes.
-4. TE timings at seq 4096, and the no-sync arms at shape L and DP = 8.
+#### Phase A: AdamW, M1 vs F2
 
-## Roadmap
+1. **Matched configuration.** Use the [Method](#method) table. This needs flex_shard #20 and #21 for fp32 shard grads. The Megatron side is already in: `--accumulate-allreduce-grads-in-fp32` (the bf16 default) gives bf16 params fp32 shard grads.
+2. **Correctness gate.**
+   - Run shape S at DP = 4, then L at DP = 8, with at least 2 microbatches for about 500 steps.
+   - Use a stable lr, e.g. 1e-4 with a 50-step warmup; 3e-4 diverges after about 5 iterations in every arm.
+   - Run M1 twice for the noise floor, since TransformerEngine kernels are not bit-deterministic.
+   - F2 passes if its loss and grad norm stay within the M1-vs-M1 spread.
+3. **Performance.**
+   - Cover S and L at 1, 2 and 8 microbatches with the TransformerEngine spec, and also seq 4096.
+   - For each cell, take the median ms/it over iterations ≥ 20. Report the min and median of at least 3 interleaved repetitions, plus peak allocated memory.
+   - Run on a quiet node, or report GPU kernel time when the node is busy.
+   - Profile one step per arm for exposed NCCL time and gaps, including M1 at L, where M1 was slower than both sharded arms.
+4. **Close gaps and record.**
+   - Make one targeted fix per F2 shortfall, e.g. prefetch depth, or bucket size against M1's `--ddp-bucket-size` 20/40/80M with nccl-tests at both sizes.
+   - Record the final numbers here.
 
-### Muon: Megatron layer-wise Muon (M3) vs FlexShard ZeRO-2 + DistMuon (F3)
+#### Phase B: Muon, M3 vs F3
+
+F3 keeps `reshard_after_forward=False` on the FlexShard side.
 
 | | M3: Megatron layer-wise Muon | F3: FlexShard ZeRO-2 + DistMuon |
 | --- | --- | --- |
@@ -165,29 +198,36 @@ Arms:
 - M3 reduce-scatters to owners by default (`use_layer_wise_param_layout=True`); the class docstring's all-reduce flow is the legacy path. It needs `emerging_optimizers` `v0.3.0`.
 - M1 and F2 serve as references, so that (M3 − M1) vs (F3 − F2) isolates the cost of switching from Adam to Muon in each stack.
 
-Wiring F3:
-1. Pick Muon params with Megatron's `is_managed_by_layer_wise_optimizer` (qkv, proj, fc1, fc2 weights), so both stacks use the same set.
-2. Add a `--flex-shard-dist-muon` mode: `assign_matrices` → owned buckets per layer, with non-matrix params on `Shard(0)` buckets.
-3. Optimizer: a `ChainedOptimizer` of DistMuon on fp32 main copies of the owned shards, plus Megatron Adam on the rest. Global grad norm over WORLD. Handle ranks that own no matrices.
-4. Relax the `--use-flex-shard` optimizer restriction.
+1. **Wire F3 in Megatron.**
+   - Pick Muon params with Megatron's `is_managed_by_layer_wise_optimizer` (qkv, proj, fc1 and fc2 weights), so both stacks use the same set.
+   - Add a `--flex-shard-dist-muon` mode: `assign_matrices` turns the Muon params into owned buckets per layer, and non-matrix params go on `Shard(0)` buckets.
+   - Optimizer: a `ChainedOptimizer` of DistMuon on fp32 main copies of the owned shards, plus Megatron Adam on the rest. Take the global grad norm over WORLD, and handle ranks that own no matrices.
+   - Relax the `--use-flex-shard` optimizer restriction.
+   - Since flex_shard #20, DistMuon's local adapter requires real-param grads in the param dtype. `--accumulate-allreduce-grads-in-fp32` gives bf16 params fp32 shard grads, so either let DistMuon accept fp32 grads or keep bf16 grads for Muon params.
+2. **Parity gate before timing.**
 
-Parity gate before timing:
+   | Knob | Megatron | DistMuon |
+   | --- | --- | --- |
+   | NS coefficients / steps | `--muon-coefficient-type`, `--muon-num-ns-steps` | `ns_coefficients` (3.4445, −4.7750, 2.0315), `ns_steps=5` |
+   | NS precision | `--muon-fp32-matmul-prec` | bf16 |
+   | Update scale | `--muon-scale-mode spectral` | `adjust_lr_fn` (`original` √max(1, r/c), `match_rms_adamw`, `spectral_unclamped`) |
+   | Momentum / weight decay | `--muon-momentum`, `--muon-nesterov`, confirm decoupled WD | 0.95, Nesterov, decoupled |
+   | QKV / fc1 split | per-head split by default (`--muon-no-split-qkv`) | whole matrix or `BlockShard`; start with no split on both sides |
 
-| Knob | Megatron | DistMuon |
-| --- | --- | --- |
-| NS coefficients / steps | `--muon-coefficient-type`, `--muon-num-ns-steps` | `ns_coefficients` (3.4445, −4.7750, 2.0315), `ns_steps=5` |
-| NS precision | `--muon-fp32-matmul-prec` | bf16 |
-| Update scale | `--muon-scale-mode spectral` | `adjust_lr_fn` (`original` √max(1, r/c), `match_rms_adamw`, `spectral_unclamped`) |
-| Momentum / weight decay | `--muon-momentum`, `--muon-nesterov`, confirm decoupled WD | 0.95, Nesterov, decoupled |
-| QKV / fc1 split | per-head split by default (`--muon-no-split-qkv`) | whole matrix or `BlockShard`; start with no split on both sides |
+   Checks:
+   - A single-matrix update agrees within ~2e-2.
+   - M3 and F3 loss curves agree over 50 iterations at a stable lr.
+   - M1 and M3 curves differ, confirming Muon is active.
+3. **Performance.** Same protocol as Phase A, step 3, also reporting (M3 − M1) vs (F3 − F2).
+4. **Risks.**
+   - Coarse ownership at DP = 8 (mitigate with block groups).
+   - DistMuon requires a grad for every configured param.
+   - Megatron's interleaved per-group QKV layout.
+   - Keep `overlap_param_gather_with_optimizer_step` off.
 
-Checks:
-- A single-matrix update agrees within ~2e-2.
-- M3 vs F3 loss curves agree over 50 iterations at a stable lr.
-- M1 vs M3 curves differ, confirming Muon is active.
+## Roadmap
 
-Risks:
-- Coarse ownership at DP = 8 (mitigate with block groups).
-- DistMuon requires a grad for every configured param.
-- Megatron's interleaved per-group QKV layout.
-- Keep `overlap_param_gather_with_optimizer_step` off.
+These are not part of the benchmark goal:
+- **Distributed checkpoint save/load** for FlexShard shards and their optimizer state, which real training runs need. flex_shard `426e2bf` adds DCP metadata for model tensors.
+- **ZeRO-3: F1 vs Megatron-FSDP (M2),** for models that don't fit with full params resident. The F1 and M2 numbers above predate flex_shard #16.
+- **TP, EP and PP,** which `validate_args` rejects today.
