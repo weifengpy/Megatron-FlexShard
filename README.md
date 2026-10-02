@@ -244,11 +244,10 @@ Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `resh
 ## Roadmap
 
 After Phases A and B, in order of benchmarking value:
-1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard shards each TP rank's local params over that rank's data-parallel group, so the code change may be small. The work:
-   - Lift the `validate_args` restriction.
-   - Check the grad-norm reduction. It sums over WORLD and relies on Megatron's existing filter, which counts params replicated across TP ranks (e.g. layer norms) only on TP rank 0. FlexShard's wrapper restores the `tensor_model_parallel` attributes that filter reads.
-   - Check the sequence-parallel layer-norm grad all-reduce. `finalize_model_grads` runs it on FlexShard's local-shard grads (`param.grad`, since there is no `main_grad`).
-   - Compare loss and grad norm with Megatron at TP 2 × DP 2 and TP 2 × DP 4, with and without sequence parallelism.
+1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. `validate_args` no longer rejects it: FlexShard shards each TP rank's slices over that rank's data-parallel group (see [Design](#design)).
+   - Tiny model at TP 2 × DP 2: iteration-1 loss and grad norm match Megatron exactly, with and without sequence parallelism, no-sync, `--qk-layernorm` and `--tp-comm-overlap`.
+   - Shape S over 500 iterations at TP 2 × DP 2 and TP 2 × DP 4, with sequence parallelism: FlexShard's loss curves differ from Megatron's about as much as Megatron's two runs differ from each other.
+   - Still to do: loss curves at TP 4 × DP 2, and the shape L benchmark at TP 2 × DP 4, including whether FlexShard needs `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` rejects `--gradient-accumulation-fusion`, so the benchmark turns it off on both sides. The comparison therefore leaves out an optimization Megatron users normally run. The work:
    - Give FlexShard's unsharded params an fp32 `main_grad` that TransformerEngine accumulates into.
    - Reduce-scatter from that buffer.
