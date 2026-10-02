@@ -41,6 +41,11 @@ class FlexShardDataParallel(_BaseDataParallel):
 
     With tensor parallelism, each rank shards its TP slices over its data-parallel group,
     which excludes its TP peers, so the model's own TP communication is unchanged.
+    Layer-norm gradients that are partial over TP (sequence parallelism, qk_layernorm) are
+    reduce-scattered over DP during backward, then all-reduced over TP after backward in one
+    coalesced call (finalize_model_grads) on the local shards, 1/DP of each norm. Megatron DDP
+    does the same on full main_grads. torchtitan's FSDP2 + TP instead all-reduces the full
+    gradients over TP per block inside backward, before the DP reduce-scatter.
 
     After wrapping, ``module.parameters()`` yields local shards as plain tensors, so a
     non-distributed Megatron optimizer updates only this rank's shard. Gradients are reduced
