@@ -45,6 +45,8 @@ class FlexShardDataParallel(_BaseDataParallel):
     left to do. Inside ``no_sync()`` (Megatron's ``no_sync_func``, wired with
     ``ddp_config.no_sync``), backwards skip the reduce-scatter and accumulate full gradients,
     in fp32 with ``grad_reduce_in_fp32``; the last microbatch's backward reduce-scatters them.
+    With ``grad_reduce_in_fp32``, local-shard gradients are fp32 too, as the distributed
+    optimizer keeps them.
 
     Args:
         config: Transformer config object.
@@ -104,6 +106,13 @@ class FlexShardDataParallel(_BaseDataParallel):
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
+        if ddp_config.grad_reduce_in_fp32:
+            # FlexShard stores each local shard's gradient in the parameter's grad_dtype
+            # (flex_shard#20), so bf16 parameters get fp32 shard gradients, which the
+            # mixed-precision optimizer then uses as main gradients without a copy.
+            for param in self.module.parameters():
+                if param.is_floating_point() and param.dtype != torch.float32:
+                    param.grad_dtype = torch.float32
         flex_shard(self.module, buckets=self.buckets)
         self.module.set_reshard_after_backward(ddp_config.reshard_after_backward)
 
