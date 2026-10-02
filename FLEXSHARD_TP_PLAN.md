@@ -12,6 +12,8 @@ With TP, each rank holds its tensor-parallel slice of each weight, and Megatron'
 
 FlexShard only sees those slices as ordinary parameters. It shards them over the rank's data-parallel group, which `FlexShardDataParallel` already takes from `pg_collection.dp_cp`, and that group excludes the TP ranks. The two layers don't touch: FlexShard all-gathers and reduce-scatters each TP slice within its data-parallel group, and the model's TP communication is unchanged. So the code change should be small, and most of the work is verification.
 
+FlexShard's Megatron integration lives in its own folder, `megatron/core/distributed/flex_shard/` (moved there in PR #5, as Megatron-FSDP lives in `megatron/core/distributed/fsdp/`). The TP changes, including the layout adapter in step 8, go there.
+
 ## What should already work
 
 **Gradient norm and clipping.**
@@ -29,7 +31,7 @@ FlexShard only sees those slices as ordinary parameters. It shards them over the
 
 1. **Lift the restriction.**
    - Remove the `--use-flex-shard` check in `validate_args` (`megatron/training/arguments.py`) that rejects `--tensor-model-parallel-size > 1`.
-   - Check that the wrapper's attribute restore keeps `tensor_model_parallel`, `partition_dim`, `partition_stride` and `sequence_parallel` on FlexShard's local shards.
+   - Check that the wrapper's attribute restore keeps `tensor_model_parallel`, `partition_dim`, `partition_stride` and `sequence_parallel` on FlexShard's local shards. The wrapper is `megatron/core/distributed/flex_shard/flex_shard_data_parallel.py`.
 2. **Check gradient norm and clipping.** Iteration-1 grad norm must match Megatron at the same TP × DP. A double-counted replicated parameter would show up as a larger norm.
 3. **Check sequence parallelism.** Test with and without `--sequence-parallel`, and with `--qk-layernorm`, whose layer-norm gradients take the same all-reduce.
 4. **Correctness runs.**
@@ -46,7 +48,36 @@ FlexShard only sees those slices as ordinary parameters. It shards them over the
    - peak allocated memory;
    - a one-step profile of each setup.
 7. **README.** Document the TP design, and remove tensor parallelism from the list of rejected options.
-8. **Later, with checkpointing.** Declare each TP slice's place in the full weight through FlexShard's outer layout (`set_global_layout`), so checkpoints carry full shapes. Training doesn't need this, so it waits for checkpoint support.
+8. **Later, with checkpointing: declare each TP slice's place in the full weight.** See [Layout adapter](#layout-adapter-step-8) below. Steps 1–7 don't depend on it.
+
+## Layout adapter (step 8)
+
+**Why training doesn't need it.** FlexShard reads a parameter's declared layout (`outer_layout`) only in its checkpoint code (`flex_shard/checkpoint.py`, through `compose_global_layouts`). That code works out where each FlexShard shard sits in the full tensor. Sharding, all-gather and reduce-scatter never use the layout. Checkpoint save/load needs it, and so does anything else that needs a shard's place in the full parameter, such as loading at a different TP or DP size.
+
+**Design.**
+- Add `megatron/core/distributed/flex_shard/layout.py`. `FlexShardDataParallel` calls it before `flex_shard()`, and it declares each parameter's `GlobalLayout` with flex_shard's `set_global_layout`.
+- It builds each layout from Megatron's own checkpoint metadata, `model.sharded_state_dict()`. Megatron already computes there each parameter's full shape and offsets under TP, EP and PP, including special cases:
+  - SwiGLU's fused fc1 stores `[gate; up]` per rank, so each rank holds two separate regions of the full tensor.
+  - Padded vocabularies.
+- `GlobalLayout` follows DCP's checkpoint layout format and accepts several regions per local tensor, so each `sharded_state_dict()` entry maps to one or more regions.
+- Checkpoints then use the same keys and full shapes as Megatron's own, so a Megatron checkpoint could load into FlexShard and back.
+
+**Alternatives not chosen.**
+- **Megatron's TP attributes** (`tensor_model_parallel`, `partition_dim`, `partition_stride`) plus the TP rank and size. This is simpler and covers ordinary column- and row-parallel weights, but it may miss the special layouts above.
+- **flex_shard's existing adapters.**
+  - `dtensor_to_global_layout` needs DTensor parameters. Megatron's TP parameters aren't DTensors, and converting the fused layouts would need DTensor's strided-shard placement, which the adapter rejects.
+  - `spmd_types_to_global_layout` needs spmd_types layout descriptions, which Megatron doesn't produce.
+
+**Why the adapter lives in Megatron, not in flex_shard's `layout_adapters`:**
+- It reads Megatron internals that change across Megatron versions. Next to `FlexShardDataParallel`, it changes and gets tested along with them.
+- flex_shard's CI has no Megatron, so in flex_shard it would effectively go untested.
+- Framework integration code lives in the framework. torchtitan's FlexShard code also lives in torchtitan.
+
+flex_shard already provides the interface: `set_global_layout` and multi-region `GlobalLayout`. On the flex_shard side, add one Megatron-free test: a local tensor that declares several regions composes correctly with FlexShard's own sharding in `compose_global_layouts`.
+
+**Verification.**
+- Collect every rank's local shards with their declared regions, reassemble the full tensors, and compare them with a TP = 1 model initialized identically (`--use-cpu-initialization`).
+- Then save a checkpoint at one TP × DP size and load it at another.
 
 ## Validation matrix
 
@@ -64,6 +95,8 @@ FlexShard only sees those slices as ordinary parameters. It shards them over the
 
 ## Effort
 
-Probably a day:
+Steps 1–7 probably take a day:
 - about an hour to lift the check and fix small issues;
 - the rest on the correctness runs, mainly the 8-GPU ones.
+
+Step 8, the layout adapter, is separate work that ships with checkpoint support.
