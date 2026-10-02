@@ -1073,8 +1073,6 @@ def validate_args(args, defaults={}):
             '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-flex-shard is not supported with pipeline parallelism'
-        assert args.tensor_model_parallel_size == 1, \
-            '--use-flex-shard is not supported with tensor parallelism yet'
         assert args.expert_model_parallel_size == 1, \
             '--use-flex-shard is not supported with expert parallelism'
         assert not args.use_distributed_optimizer, \
