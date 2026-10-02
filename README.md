@@ -116,38 +116,38 @@ Setup:
 - Mock data, bf16 params, MBS 1, seq 2048, lr 3e-4.
 - Timing is the median over iterations ≥ 20.
 
-Shapes:
-- **S:** 24 layers, hidden 2048, ffn 5632, 16 heads (1.5B).
-- **L:** 32 layers, hidden 4096, ffn 14336, GQA 32/8 (8B). It runs with `--recompute-granularity selective` in every setup, because Megatron with the distributed optimizer runs out of memory without it.
+Models:
+- **1.4B model:** 24 layers, hidden 2048, ffn 5632, 16 heads (1.36B parameters).
+- **7.2B model:** 32 layers, hidden 4096, ffn 14336, GQA 32/8, i.e. Llama-3-8B layers with a 32K vocabulary (7.24B parameters). It runs with `--recompute-granularity selective` in every setup, because Megatron with the distributed optimizer runs out of memory without it.
 
 ### Results (local spec, no TransformerEngine)
 
 These were measured with FlexShard before flex_shard #16 and with bf16 FlexShard shard grads. Phase A re-measures them.
 
-| Shape | Megatron DDP + distributed optimizer, ms/it | FlexShard without reshard-after-forward, ms/it | Change | Max allocated, Megatron / FlexShard |
+| Model | Megatron DDP + distributed optimizer, ms/it | FlexShard without reshard-after-forward, ms/it | Change | Max allocated, Megatron / FlexShard |
 | --- | --- | --- | --- | --- |
-| S | 157.7 | 156.6 | −1% | 21.5 / 16.5 GB |
-| L | 594.9 | 538.1 | −10% | 59.4 / 33.6 GB |
+| 1.4B | 157.7 | 156.6 | −1% | 21.5 / 16.5 GB |
+| 7.2B | 594.9 | 538.1 | −10% | 59.4 / 33.6 GB |
 
-- **Profile (S, rank 0, one step):**
+- **Profile (1.4B model, rank 0, one step):**
   - Compute is the same in both setups (~117 ms).
   - FlexShard exposes 45.5 ms of NCCL time (all-gather 25.3, reduce-scatter 17.6), against 13.0 ms for Megatron.
   - FlexShard's stalls are ~1 ms gaps before `split_with_sizes_copy_out`: each layer waits for its own all-gather, and one-bucket-ahead prefetch does not hide it.
 - **4 microbatches, before FlexShard had no-sync (not like-for-like):**
-  - Megatron vs FlexShard: S 495.8 vs 545.3 ms (+10%); L 1824.4 vs 2006.2 ms (+10%).
-  - FlexShard's extra cost per microbatch at S (+17 ms) matches its exposed reduce-scatter.
-  - See [Gradient accumulation with no-sync](#gradient-accumulation-with-no-sync-te-s-dp--4) for the fix.
-- **ZeRO-3 pair, 1 microbatch:** FlexShard with reshard-after-forward vs Megatron-FSDP is 179.9 vs 164.1 ms (S) and 649.6 vs 533.0 ms (L), with similar memory.
+  - Megatron vs FlexShard: 495.8 vs 545.3 ms (+10%) on the 1.4B model, 1824.4 vs 2006.2 ms (+10%) on the 7.2B model.
+  - FlexShard's extra cost per microbatch on the 1.4B model (+17 ms) matches its exposed reduce-scatter.
+  - See [Gradient accumulation with no-sync](#gradient-accumulation-with-no-sync-transformerengine-14b-model-dp--4) for the fix.
+- **ZeRO-3 pair, 1 microbatch:** FlexShard with reshard-after-forward vs Megatron-FSDP is 179.9 vs 164.1 ms on the 1.4B model and 649.6 vs 533.0 ms on the 7.2B model, with similar memory.
 - **Correctness:**
   - Iteration-1 loss and grad norm are bit-identical across all five setups with the local spec: Megatron DDP, Megatron with the distributed optimizer, Megatron-FSDP, and FlexShard with and without reshard-after-forward.
   - With the TransformerEngine spec, they are bit-identical across Megatron with the distributed optimizer and both FlexShard setups.
   - A 4-layer model tracks over 20 iterations (loss 2.357658 vs 2.357765).
-  - S and L diverge after ~iteration 5 in every setup, Megatron DDP vs Megatron with the distributed optimizer included, because lr 3e-4 is unstable for them.
+  - The 1.4B and 7.2B models diverge after ~iteration 5 in every setup, Megatron DDP vs Megatron with the distributed optimizer included, because lr 3e-4 is unstable for them.
 
-### Gradient accumulation with no-sync (TE, S, DP = 4)
+### Gradient accumulation with no-sync (TransformerEngine, 1.4B model, DP = 4)
 
 Setup:
-- TransformerEngine spec, shape S, 4x H100 with no other jobs, MBS 1.
+- TransformerEngine spec, 1.4B model, 4x H100 with no other jobs, MBS 1.
 - GBS 8 means 2 microbatches per step, and GBS 32 means 8.
 - Two GPU sets ran the two GBS series at the same time. Each cell is the mean of two interleaved repetitions of the median ms/it over iterations ≥ 20.
 - "No-sync" means `--flex-shard-no-sync`. "Params kept" means `--flex-shard-no-reshard-after-backward` on top of it.
@@ -185,15 +185,15 @@ Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward.
 
 1. **Matched configuration.** Use the [Method](#method) table. This needs flex_shard #20 and #21 for fp32 shard grads. The Megatron side is already in: `--accumulate-allreduce-grads-in-fp32` (the bf16 default) gives bf16 params fp32 shard grads.
 2. **Correctness gate.**
-   - Run shape S at DP = 4, then L at DP = 8, with at least 2 microbatches for about 500 steps.
+   - Run the 1.4B model at DP = 4, then the 7.2B model at DP = 8, with at least 2 microbatches for about 500 steps.
    - Use a stable lr, e.g. 1e-4 with a 50-step warmup; 3e-4 diverges after about 5 iterations in every setup.
    - Run the Megatron baseline twice for the noise floor, since TransformerEngine kernels are not bit-deterministic.
    - FlexShard passes if its loss and grad norm stay within the spread between the two Megatron runs.
 3. **Performance.**
-   - Cover S and L at 1, 2 and 8 microbatches with the TransformerEngine spec, and also seq 4096.
+   - Cover both models at 1, 2 and 8 microbatches with the TransformerEngine spec, and also seq 4096.
    - For each cell, take the median ms/it over iterations ≥ 20. Report the min and median of at least 3 interleaved repetitions, plus peak allocated memory.
    - Run on a quiet node, or report GPU kernel time when the node is busy.
-   - Profile one step per setup for exposed NCCL time and gaps, including Megatron at L, where it was slower than both FlexShard setups.
+   - Profile one step per setup for exposed NCCL time and gaps, including Megatron on the 7.2B model, where it was slower than both FlexShard setups.
 4. **Close gaps and record.**
    - Make one targeted fix per FlexShard shortfall, e.g. prefetch depth, or bucket size against Megatron's `--ddp-bucket-size` 20/40/80M with nccl-tests at both sizes.
    - Record the final numbers here.
@@ -245,9 +245,9 @@ Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `resh
 
 After Phases A and B, in order of benchmarking value:
 1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. `validate_args` no longer rejects it: FlexShard shards each TP rank's slices over that rank's data-parallel group (see [Design](#design)).
-   - Tiny model at TP 2 × DP 2: iteration-1 loss and grad norm match Megatron exactly, with and without sequence parallelism, no-sync, `--qk-layernorm` and `--tp-comm-overlap`.
-   - Shape S over 500 iterations at TP 2 × DP 2 and TP 2 × DP 4, with sequence parallelism: FlexShard's loss curves differ from Megatron's about as much as Megatron's two runs differ from each other.
-   - Still to do: loss curves at TP 4 × DP 2, and the shape L benchmark at TP 2 × DP 4, including whether FlexShard needs `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+   - 117M model (4 layers, hidden 1024) at TP 2 × DP 2: iteration-1 loss and grad norm match Megatron exactly, with and without sequence parallelism, no-sync, `--qk-layernorm` and `--tp-comm-overlap`.
+   - 1.4B model over 500 iterations at TP 2 × DP 2 and TP 2 × DP 4, with sequence parallelism: FlexShard's loss curves differ from Megatron's about as much as Megatron's two runs differ from each other.
+   - Still to do: loss curves at TP 4 × DP 2, and the 7.2B model benchmark at TP 2 × DP 4, including whether FlexShard needs `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` rejects `--gradient-accumulation-fusion`, so the benchmark turns it off on both sides. The comparison therefore leaves out an optimization Megatron users normally run. The work:
    - Give FlexShard's unsharded params an fp32 `main_grad` that TransformerEngine accumulates into.
    - Reduce-scatter from that buffer.
