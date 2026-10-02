@@ -227,7 +227,15 @@ F3 keeps `reshard_after_forward=False` on the FlexShard side.
 
 ## Roadmap
 
-These are not part of the benchmark goal:
-- **Distributed checkpoint save/load** for FlexShard shards and their optimizer state, which real training runs need. flex_shard `426e2bf` adds DCP metadata for model tensors.
-- **ZeRO-3: F1 vs Megatron-FSDP (M2),** for models that don't fit with full params resident. The F1 and M2 numbers above predate flex_shard #16.
-- **TP, EP and PP,** which `validate_args` rejects today.
+After Phases A and B, in order of benchmarking value:
+1. **TP (M1 vs F2 at `TP × DP`).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. FlexShard can already describe TP-sharded params through its outer layout. The work:
+   - Lift the `validate_args` restriction.
+   - Fix the grad-norm and clipping reductions. Today they sum over WORLD, since each grad element lives on exactly one DP rank, so params replicated across TP ranks (e.g. layer norms) would be counted twice.
+   - Check the sequence-parallel layer-norm grad all-reduce.
+2. **EP (MoE, M1 vs F2).**
+   - Put expert params in buckets over the expert data-parallel group. FlexShard supports one mesh per bucket, as in its MoE example.
+   - Dense params stay on the DP group, and the token dispatcher is untouched.
+   - Move EP ahead of TP if MoE is the main target.
+3. **PP.** `--flex-shard-no-sync` already follows the grad-sync enable/disable calls in Megatron's pipeline schedules.
+4. **Distributed checkpoint save/load** for FlexShard shards and their optimizer state. Benchmarks don't save or load, but real training runs need it. flex_shard `426e2bf` adds DCP metadata for model tensors.
+5. **ZeRO-3: F1 vs Megatron-FSDP (M2),** only for models that don't fit with full params resident. The F1 and M2 numbers above predate flex_shard #16.
