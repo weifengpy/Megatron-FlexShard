@@ -63,15 +63,16 @@ class FlexShardDataParallel(_BaseDataParallel):
     the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
     gradient FlexShard reduce-scatters, across microbatches with no_sync.
 
-    With tied embeddings, on the stage that holds both the embedding and the output layer (the
-    only stage without pipeline parallelism, the MTP stage with it), the output layer reuses the
-    embedding's weight at call time and registers none, so FlexShard cannot see that use from
-    parameter names. The final norm's
-    parameters join the embedding bucket, as torchtitan groups [tok_embeddings, norm, lm_head]
-    for FSDP2: their deepest common module is the model root, which also runs the output layer,
-    so the bucket's hooks gather the weight before every use and reduce-scatter it after all of
-    them. The bucket skips reshard-after-forward, which at the root would free the weight right
-    before backward re-gathers it.
+    With tied embeddings, the model fetches the output weight before it calls the output layer
+    and passes it in at call time, so FlexShard cannot see that use from parameter names. On the
+    stage that holds the embedding (the only stage without pipeline parallelism, the MTP stage
+    with it), the output layer registers no weight and reuses the embedding's; on a last stage
+    without it, the weight is the output layer's own copy. The final norm's parameters join the
+    bucket holding that weight, as torchtitan groups [tok_embeddings, norm, lm_head] for FSDP2:
+    their deepest common module is the model root, so the bucket's hooks gather the weight before
+    the model fetches it and reduce-scatter it after every use. The bucket skips
+    reshard-after-forward, which at the root would free the weight right before backward
+    re-gathers it.
 
     With expert parallelism, expert parameters (``allreduce=False``) exist only on their EP rank
     and are replicated over the expert data-parallel group, so each MoE layer's experts get
@@ -224,15 +225,13 @@ class FlexShardDataParallel(_BaseDataParallel):
     def _find_tied_output_weight(self) -> Optional[Tuple[str, str]]:
         """``(weight FQN, output-layer path)`` if the output layer reuses the embedding weight."""
         for name, submodule in self.module.named_modules():
-            # The output layer reuses the embedding weight at call time on the stage that holds
-            # both: the only stage without pipeline parallelism, or the MTP stage.
+            # With tied weights, the model fetches the output weight before it calls the output
+            # layer and passes it in: the embedding's weight on the stage that holds the
+            # embedding (the only stage without pipeline parallelism, or the MTP stage), else
+            # the output layer's own copy. Either way its bucket must be gathered by then.
             if not (
                 getattr(submodule, "share_embeddings_and_output_weights", False)
                 and getattr(submodule, "post_process", False)
-                and (
-                    getattr(submodule, "pre_process", False)
-                    or getattr(submodule, "mtp_process", False)
-                )
             ):
                 continue
             weight = submodule.shared_embedding_or_output_weight()
@@ -303,19 +302,20 @@ class FlexShardDataParallel(_BaseDataParallel):
         assert claimed == set(params), f"Unbucketed parameters: {set(params) - claimed}"
 
         if tied is not None:
-            # The final norm joins the embedding bucket, so the bucket's common module, where
-            # FlexShard hooks it, is the model root that also runs the output layer.
+            # The final norm joins the bucket holding the tied weight (the embedding's, or the
+            # output layer's own copy), so the bucket's common module, where FlexShard hooks it,
+            # is the model root that fetches the weight and runs the output layer.
             weight_fqn, output_layer_path = tied
             norm_prefix = output_layer_path[: -len("output_layer")] + "decoder.final_layernorm."
-            embedding = next(fqns for fqns in buckets if weight_fqn in fqns)
+            tied_fqns = next(fqns for fqns in buckets if weight_fqn in fqns)
             norms = [fqns for fqns in buckets if fqns[0].startswith(norm_prefix)]
             if not norms:
                 raise ValueError(
-                    "FlexShard with tied embeddings groups the final norm with the embedding, "
+                    "FlexShard with tied embeddings groups the final norm with the tied weight, "
                     f"but found no parameters under {norm_prefix!r}."
                 )
             for fqns in norms:
-                embedding.extend(fqns)
+                tied_fqns.extend(fqns)
                 buckets.remove(fqns)
 
         # Expert parameters shard over the expert data-parallel group, so an MoE layer's
