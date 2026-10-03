@@ -745,7 +745,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         handle = None
         tp_group = ctx.tp_group
 
-        if ctx.gradient_accumulation_fusion:
+        # FlexShard attaches main_grad only before backward, so forward may have seen none;
+        # keep the weight's main_grad rather than overwrite it with that.
+        if ctx.gradient_accumulation_fusion and main_grad is not None:
             weight.main_grad = main_grad
 
         wgrad_compute = True
