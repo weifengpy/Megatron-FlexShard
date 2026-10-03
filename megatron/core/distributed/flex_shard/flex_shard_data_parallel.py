@@ -127,9 +127,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 "FlexShard with tied embeddings needs the embedding bucket's hooks on a module "
                 f"that also runs the output layer, got {anchor!r} for {output_layer_path!r}."
             )
-        fused_fqns = (
-            self._fused_wgrad_fqns(tied) if config.gradient_accumulation_fusion else set()
-        )
+        fused_fqns = self._fused_wgrad_fqns(tied) if config.gradient_accumulation_fusion else set()
         uses_main_grad = [any(fqn in fused_fqns for fqn in fqns) for fqns in bucket_fqns]
         # Passed only where needed, so FlexShard without fusion still works with a flex_shard
         # that predates the hooks.
