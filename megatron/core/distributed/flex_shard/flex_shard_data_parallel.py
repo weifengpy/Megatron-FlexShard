@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -57,10 +57,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     optimizer keeps them.
 
     With gradient accumulation fusion, TransformerEngine's and Megatron's linear layers add
-    weight gradients straight into ``param.main_grad`` and give autograd none. Buckets with
-    such layers set FlexShard's ``BucketSpec.main_grad``, which aliases each gathered
-    parameter's gradient as ``main_grad`` before the bucket's backward, so the fused GEMMs
-    accumulate into the gradient FlexShard reduce-scatters, across microbatches with no_sync.
+    weight gradients straight into ``param.main_grad`` and give autograd none. For buckets
+    with such layers, FlexShard's pre-backward hook allocates each gathered parameter's
+    gradient and aliases it as ``main_grad``, and its post-reduce hook drops the alias once
+    the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
+    gradient FlexShard reduce-scatters, across microbatches with no_sync.
 
     Args:
         config: Transformer config object.
@@ -109,6 +110,7 @@ class FlexShardDataParallel(_BaseDataParallel):
         )
         bucket_fqns = self._build_bucket_fqns()
         fused_fqns = self._fused_wgrad_fqns() if config.gradient_accumulation_fusion else set()
+        uses_main_grad = [any(fqn in fused_fqns for fqn in fqns) for fqns in bucket_fqns]
         self.buckets = [
             BucketSpec(
                 fqns,
@@ -118,7 +120,8 @@ class FlexShardDataParallel(_BaseDataParallel):
                 reshard_after_forward=(
                     ddp_config.reshard_after_forward and i < len(bucket_fqns) - 1
                 ),
-                main_grad=any(fqn in fused_fqns for fqn in fqns),
+                pre_backward_hook=self._alias_main_grads if uses_main_grad[i] else None,
+                post_reduce_hook=self._drop_main_grads if uses_main_grad[i] else None,
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
@@ -144,7 +147,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"reshard_after_forward={ddp_config.reshard_after_forward}, "
             f"no_sync={ddp_config.no_sync}, "
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
-            f"main_grad buckets={sum(bucket.main_grad for bucket in self.buckets)}, "
+            f"main_grad buckets={sum(uses_main_grad)}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
 
@@ -157,6 +160,28 @@ class FlexShardDataParallel(_BaseDataParallel):
             or getattr(submodule, "gradient_accumulation_fusion", False)
             for param_name, _ in submodule.named_parameters(recurse=False)
         }
+
+    def _alias_main_grads(self, named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
+        """FlexShard pre-backward hook: expose each gathered parameter's gradient as main_grad.
+
+        Fused gradient accumulation adds weight gradients into ``main_grad`` in place, so the
+        gradient must exist before the bucket's backward. A missing one is allocated zeroed in
+        the accumulation dtype, which autograd's gradients for unfused parameters also add into.
+        Without gradient sync, FlexShard keeps it for the next microbatch.
+        """
+        for _, param in named_params:
+            if not param.requires_grad:
+                continue
+            if param.grad is None:
+                dtype = torch.float32 if self.ddp_config.grad_reduce_in_fp32 else param.dtype
+                param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
+            param.main_grad = param.grad
+
+    @staticmethod
+    def _drop_main_grads(named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
+        """FlexShard post-reduce hook: drop main_grad once the gradient it aliases is gone."""
+        for _, param in named_params:
+            vars(param).pop("main_grad", None)
 
     def _build_bucket_fqns(self) -> List[List[str]]:
         """Group parameter FQNs into buckets in forward (module registration) order."""
