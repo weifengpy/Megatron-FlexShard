@@ -63,8 +63,10 @@ class FlexShardDataParallel(_BaseDataParallel):
     the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
     gradient FlexShard reduce-scatters, across microbatches with no_sync.
 
-    With tied embeddings, the output layer reuses the embedding's weight at call time and
-    registers none, so FlexShard cannot see that use from parameter names. The final norm's
+    With tied embeddings, on the stage that holds both the embedding and the output layer (the
+    only stage without pipeline parallelism, the MTP stage with it), the output layer reuses the
+    embedding's weight at call time and registers none, so FlexShard cannot see that use from
+    parameter names. The final norm's
     parameters join the embedding bucket, as torchtitan groups [tok_embeddings, norm, lm_head]
     for FSDP2: their deepest common module is the model root, which also runs the output layer,
     so the bucket's hooks gather the weight before every use and reduce-scatter it after all of
@@ -78,6 +80,13 @@ class FlexShardDataParallel(_BaseDataParallel):
     so its bucket divides by the dense data-parallel size, not its own group's (Megatron DDP's
     expert gradient scaling, FSDP2's gradient divide factor). With per-token loss, every bucket
     sums instead, and finalize_model_grads divides by the global token count.
+
+    With pipeline parallelism, each model chunk (one per virtual pipeline stage) is its own
+    FlexShardDataParallel. Megatron's schedules run each microbatch's backward separately and
+    re-enable sync before each chunk's last microbatch backward, which reduce-scatters. Tied
+    embedding and output weights on the first and last stages are separate copies, which
+    finalize_model_grads all-reduces over the embedding group on the local shards; both stages
+    shard them identically.
 
     Args:
         config: Transformer config object.
@@ -215,10 +224,15 @@ class FlexShardDataParallel(_BaseDataParallel):
     def _find_tied_output_weight(self) -> Optional[Tuple[str, str]]:
         """``(weight FQN, output-layer path)`` if the output layer reuses the embedding weight."""
         for name, submodule in self.module.named_modules():
+            # The output layer reuses the embedding weight at call time on the stage that holds
+            # both: the only stage without pipeline parallelism, or the MTP stage.
             if not (
                 getattr(submodule, "share_embeddings_and_output_weights", False)
-                and getattr(submodule, "pre_process", False)
                 and getattr(submodule, "post_process", False)
+                and (
+                    getattr(submodule, "pre_process", False)
+                    or getattr(submodule, "mtp_process", False)
+                )
             ):
                 continue
             weight = submodule.shared_embedding_or_output_weight()

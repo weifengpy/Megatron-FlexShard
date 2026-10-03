@@ -1071,8 +1071,6 @@ def validate_args(args, defaults={}):
     if args.use_flex_shard:
         assert not (args.use_torch_fsdp2 or args.use_megatron_fsdp), \
             '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
-        assert args.pipeline_model_parallel_size == 1, \
-            '--use-flex-shard is not supported with pipeline parallelism'
         # FlexShard reduce-scatters each bucket's gradients when its backward ends, before
         # TransformerEngine's delayed backward_dw() would add the weight gradients.
         assert not args.delay_wgrad_compute, \
