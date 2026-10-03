@@ -1141,6 +1141,15 @@ def forward_backward_pipelining_with_interleaving(
 
     disable_grad_sync()
 
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        from megatron.core.distributed.flex_shard import FlexShardDataParallel
+
+        # The EP overlap schedule calls the layers' sub-modules directly, bypassing the
+        # forward hooks that gather FlexShard's buckets, so gather every chunk's for the step.
+        for model_chunk in model:
+            if isinstance(model_chunk, FlexShardDataParallel):
+                model_chunk.unshard()
+
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
 
