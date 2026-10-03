@@ -2872,6 +2872,14 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         for f in dataclasses.fields(DistributedDataParallelConfig):
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
+        # TransformerEngine also leaves the routed experts' weight gradients to backward_dw() with
+        # --overlap-dispatch-backward-with-experts-wgrad, so DDP must mark them ready from
+        # TransformerEngine's weight-gradient hooks, as with --delay-wgrad-compute. From the
+        # autograd hook, DDP would add TransformerEngine's still-unfilled weight-gradient buffer
+        # (without fusion), or reduce the bucket before backward_dw() adds the gradients (fusion).
+        kwargs["delay_wgrad_compute"] = (
+            args.delay_wgrad_compute or args.overlap_dispatch_backward_with_experts_wgrad
+        )
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
         kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
