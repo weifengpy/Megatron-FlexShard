@@ -1093,18 +1093,20 @@ def validate_args(args, defaults={}):
         assert args.flex_shard_no_sync or args.flex_shard_reshard_after_backward, \
             '--flex-shard-no-reshard-after-backward requires --flex-shard-no-sync'
 
-        if args.fp8_param_gather and is_te_min_version("2.0.0"):
+        # FlexShard all-gathers parameters in their own dtype; it has no FP8 or FP4 path yet,
+        # with any TransformerEngine version.
+        if args.fp8_param_gather:
             args.fp8_param_gather = False
             warn_rank_0(
-                'FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16'
-                'all_gather instead, turning off fp8_param_gather',
+                '--use-flex-shard does not support --fp8-param-gather yet; FlexShard will '
+                'all-gather bf16 parameters instead, turning off fp8_param_gather',
                 args.rank,
             )
-        if args.fp4_param_gather and not is_te_min_version("2.7.0.dev0"):
+        if args.fp4_param_gather:
             args.fp4_param_gather = False
             warn_rank_0(
-                'FSDP2 FP4 param gather is not supported yet in TE 2.0, will fallback to bf16'
-                'all_gather instead, turning off fp4_param_gather',
+                '--use-flex-shard does not support --fp4-param-gather yet; FlexShard will '
+                'all-gather bf16 parameters instead, turning off fp4_param_gather',
                 args.rank,
             )
 

@@ -702,7 +702,11 @@ def _get_megatron_optimizer_based_on_param_groups(
         # FP32 optimizer.
         assert grad_scaler is None
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
-        setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+        if isinstance(model_chunks[0], FlexShardDataParallel):
+            # As above: each gradient element lives on exactly one data-parallel rank.
+            setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
+        else:
+            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
