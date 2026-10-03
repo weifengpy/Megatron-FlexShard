@@ -1071,12 +1071,21 @@ def validate_args(args, defaults={}):
     if args.use_flex_shard:
         assert not (args.use_torch_fsdp2 or args.use_megatron_fsdp), \
             '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
-        # FlexShard reduce-scatters each bucket's gradients when its backward ends, before
-        # TransformerEngine's delayed backward_dw() would add the weight gradients.
-        assert not args.delay_wgrad_compute, \
-            '--use-flex-shard is not supported with --delay-wgrad-compute'
-        assert not args.overlap_moe_expert_parallel_comm, \
-            '--use-flex-shard is not supported with --overlap-moe-expert-parallel-comm'
+        # Without fusion, TransformerEngine's backward_dw() assigns delayed weight gradients to
+        # param.grad, which would overwrite the gradients FlexShard accumulates there without
+        # sync, which the EP overlap schedule (required by --delay-wgrad-compute) needs.
+        assert not args.delay_wgrad_compute or args.gradient_accumulation_fusion, \
+            '--use-flex-shard with --delay-wgrad-compute needs gradient accumulation fusion'
+        if args.overlap_moe_expert_parallel_comm:
+            # The EP overlap schedule calls the layers' sub-modules directly, bypassing the
+            # forward hooks that gather FlexShard's buckets, so FlexShard gathers every bucket
+            # for the step and reduce-scatters after it, as Megatron DDP keeps full parameters
+            # and gradients.
+            assert (not args.flex_shard_reshard_after_forward and args.flex_shard_no_sync
+                    and not args.flex_shard_reshard_after_backward), (
+                '--use-flex-shard with --overlap-moe-expert-parallel-comm needs '
+                '--flex-shard-no-reshard-after-forward --flex-shard-no-sync '
+                '--flex-shard-no-reshard-after-backward')
         # Without fusion, TransformerEngine's backward_dw() assigns delayed weight gradients to
         # param.grad, which would overwrite the gradients FlexShard accumulates there without sync.
         assert not (

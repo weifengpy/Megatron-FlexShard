@@ -85,7 +85,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     TransformerEngine's delayed weight gradients (--overlap-dispatch-backward-with-experts-wgrad),
     the experts' backward leaves their weight gradients to backward_dw(), which the token
     dispatch's backward runs afterwards; their buckets defer FlexShard's post-backward until
-    Megatron calls the weights' post_wgrad_grad_acc_hook after backward_dw().
+    Megatron calls the weights' post_wgrad_grad_acc_hook after backward_dw(). The EP overlap
+    schedule (--overlap-moe-expert-parallel-comm) calls the layers' sub-modules directly,
+    bypassing FlexShard's forward hooks, and runs each layer's backward as several backward
+    calls: it gathers every bucket before the step (unshard), backwards finish nothing (manual
+    finalization), and start_grad_sync reduce-scatters after the step's last backward.
 
     With pipeline parallelism, each model chunk (one per virtual pipeline stage) is its own
     FlexShardDataParallel. Megatron's schedules run each microbatch's backward separately. With
@@ -181,6 +185,9 @@ class FlexShardDataParallel(_BaseDataParallel):
             )
         fused_fqns = self._fused_wgrad_fqns(tied) if config.gradient_accumulation_fusion else set()
         uses_main_grad = [any(fqn in fused_fqns for fqn in fqns) for fqns in bucket_fqns]
+        self._main_grad_bucket_fqns = [
+            fqns for fqns, used in zip(bucket_fqns, uses_main_grad) if used
+        ]
         # Passed only where needed, so FlexShard without fusion still works with a flex_shard
         # that predates the hooks.
         main_grad_hooks = dict(
@@ -217,6 +224,10 @@ class FlexShardDataParallel(_BaseDataParallel):
                     param.grad_dtype = torch.float32
         flex_shard(self.module, buckets=self.buckets)
         self.module.set_reshard_after_backward(ddp_config.reshard_after_backward)
+        if config.overlap_moe_expert_parallel_comm:
+            # The EP overlap schedule runs each layer's backward as several backward calls, so
+            # backwards finish nothing; start_grad_sync finalizes after the step's last one.
+            self.module.set_manual_backward_finalization(True)
         # The reduce-scatters start_grad_sync issued, for finish_grad_sync to wait on.
         self._grad_sync_handle = None
 
@@ -304,6 +315,15 @@ class FlexShardDataParallel(_BaseDataParallel):
                 dtype = torch.float32 if self.ddp_config.grad_reduce_in_fp32 else param.dtype
                 param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
             param.main_grad = param.grad
+
+    def unshard(self) -> None:
+        """Gather every bucket for a schedule that calls the layers' sub-modules directly (the
+        EP overlap schedule), bypassing FlexShard's forward and pre-backward hooks. Fused layers'
+        main_grad aliases, which the pre-backward hook would set, are set here. The buckets
+        stay gathered until start_grad_sync finalizes the step."""
+        self.module.unshard()
+        for fqns in self._main_grad_bucket_fqns:
+            self._alias_main_grads([(fqn, self.module.get_parameter(fqn)) for fqn in fqns])
 
     def _finish_deferred_backward(self, fqn: str) -> None:
         """post_wgrad_grad_acc_hook of a delayed weight: backward_dw() has computed its bucket's
@@ -399,6 +419,10 @@ class FlexShardDataParallel(_BaseDataParallel):
         Wait for the reduce-scatters start_grad_sync issued. FlexShard waits for the ones issued
         during a backward at the end of that backward.
         """
+        if self._grad_sync_handle is None and self.config.overlap_moe_expert_parallel_comm:
+            # With the EP overlap schedule's manual finalization, a step whose schedule did not
+            # call start_grad_sync (e.g. without --align-grad-reduce) finalizes here.
+            self.start_grad_sync()
         if self._grad_sync_handle is not None:
             self._grad_sync_handle.wait()
             self._grad_sync_handle = None

@@ -76,6 +76,14 @@ def combined_1f1b_schedule_for_no_pipelining(
         # We must do this explicitly before the schedule accesses layers directly.
         fsdp_wrapper._replace_param_with_raw_if_needed()
 
+    from megatron.core.distributed.flex_shard import FlexShardDataParallel
+
+    flex_shard_wrapper = model if isinstance(model, FlexShardDataParallel) else None
+    if flex_shard_wrapper is not None:
+        # The schedule calls the layers' sub-modules directly, bypassing the forward hooks
+        # that gather FlexShard's buckets, so gather all of them for the step.
+        flex_shard_wrapper.unshard()
+
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -135,6 +143,11 @@ def combined_1f1b_schedule_for_no_pipelining(
         config,
         fsdp_wrapper=fsdp_wrapper,
     )
+    if flex_shard_wrapper is not None:
+        # The schedule splits each layer's backward into several backward calls, so FlexShard's
+        # backwards finish nothing (manual finalization). Reduce-scatter what the step
+        # accumulated; finalize_model_grads waits for it in finish_grad_sync.
+        flex_shard_wrapper.start_grad_sync()
     return forward_data_store, total_num_tokens
 
 
