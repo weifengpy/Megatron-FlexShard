@@ -83,11 +83,14 @@ class FlexShardDataParallel(_BaseDataParallel):
     sums instead, and finalize_model_grads divides by the global token count.
 
     With pipeline parallelism, each model chunk (one per virtual pipeline stage) is its own
-    FlexShardDataParallel. Megatron's schedules run each microbatch's backward separately and
-    re-enable sync before each chunk's last microbatch backward, which reduce-scatters. Tied
-    embedding and output weights on the first and last stages are separate copies, which
-    finalize_model_grads all-reduces over the embedding group on the local shards; both stages
-    shard them identically.
+    FlexShardDataParallel. Megatron's schedules run each microbatch's backward separately. With
+    no-sync and --align-grad-reduce (the default), later stages run their last backward without
+    sync too, then call start_grad_sync, which reduce-scatters the accumulated gradients outside
+    backward (flex_shard's finalize_backward), so the reduce-scatter overlaps the pipeline
+    bubble, as Megatron DDP's does; finish_grad_sync waits for it. Tied embedding and output
+    weights on the first and last stages are separate copies, which finalize_model_grads
+    all-reduces over the embedding group on the local shards; both stages shard them
+    identically.
 
     Args:
         config: Transformer config object.
@@ -189,6 +192,8 @@ class FlexShardDataParallel(_BaseDataParallel):
                     param.grad_dtype = torch.float32
         flex_shard(self.module, buckets=self.buckets)
         self.module.set_reshard_after_backward(ddp_config.reshard_after_backward)
+        # The reduce-scatters start_grad_sync issued, for finish_grad_sync to wait on.
+        self._grad_sync_handle = None
 
         for name, param in self.module.named_parameters():
             for attr_name, attr_value in custom_attrs.get(name, {}).items():
@@ -348,11 +353,24 @@ class FlexShardDataParallel(_BaseDataParallel):
             if param.grad is not None:
                 param.grad.mul_(scaling_factor)
 
+    def start_grad_sync(self, *unused):
+        """
+        Reduce-scatter the gradients that backwards without sync accumulated, without waiting.
+
+        Pipeline schedules call it (as grad_sync_func, with --align-grad-reduce) after a model
+        chunk's last microbatch backward, so the reduce-scatter overlaps the pipeline bubble.
+        """
+        self.module.set_requires_gradient_sync(True)
+        self._grad_sync_handle = self.module.finalize_backward(async_op=True)
+
     def finish_grad_sync(self, force_all_reduce=False):
         """
-        No-op: FlexShard waits for all reduce-scatters at the end of backward.
+        Wait for the reduce-scatters start_grad_sync issued. FlexShard waits for the ones issued
+        during a backward at the end of that backward.
         """
-        pass
+        if self._grad_sync_handle is not None:
+            self._grad_sync_handle.wait()
+            self._grad_sync_handle = None
 
 
 def _is_expert_param(param: torch.nn.Parameter) -> bool:

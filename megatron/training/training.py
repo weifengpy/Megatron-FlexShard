@@ -4842,11 +4842,10 @@ def train(
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
         # With a grad_sync_func, pipeline schedules re-enable grad sync before the last backward
-        # only on the first stage, and start the other stages' grad sync afterwards through it.
-        # FlexShard reduce-scatters during a syncing backward and cannot reduce outside one
-        # (its start_grad_sync is a no-op), so it leaves grad_sync_func unset: every stage then
-        # re-enables sync before each model chunk's last microbatch backward.
-        if args.align_grad_reduce and not isinstance(model[0], FlexShardDataParallel):
+        # only on the first stage, and start the other stages' grad sync afterwards through it,
+        # in the pipeline bubble. FlexShard's start_grad_sync reduce-scatters the gradients that
+        # backwards without sync accumulated, outside backward.
+        if args.align_grad_reduce:
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
