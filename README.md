@@ -25,7 +25,6 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 `validate_args` rejects combining `--use-flex-shard` with any of:
 - PP or EP > 1
 - `--use-distributed-optimizer`, `--overlap-param-gather`
-- tied embeddings
 - fp16
 - optimizers other than Adam / SGD
 - `--use-torch-fsdp2` or `--use-megatron-fsdp`
@@ -69,6 +68,7 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 - **Process groups** come from `pg_collection.dp_cp`, with a fallback to `parallel_state` for callers that don't pass groups.
 - **Tensor parallelism.** With TP, each rank's parameters are its TP slices, and FlexShard shards them over the rank's `dp_cp` group, which excludes its TP peers. Megatron's layers keep their own TP communication: column- and row-parallel linears, sequence-parallel all-gathers and reduce-scatters, and TransformerEngine's `--tp-comm-overlap`. The restored `tensor_model_parallel` attributes keep the grad-norm filter (`param_is_not_tensor_parallel_duplicate`) counting TP-replicated parameters, such as layer norms, once. `finalize_model_grads` all-reduces sequence-parallel and `--qk-layernorm` layer-norm gradients over TP on `param.grad`, FlexShard's local-shard gradient, since there is no `main_grad`. On Hopper, Megatron requires `CUDA_DEVICE_MAX_CONNECTIONS=1` with TP, and FlexShard runs with it.
 - **Gradient accumulation fusion.** With it, TransformerEngine's and Megatron's linear layers add weight gradients straight into `param.main_grad` and give autograd none. For buckets with such layers, the wrapper passes flex_shard two per-bucket hooks. The pre-backward hook allocates each gathered parameter's gradient, zeroed and fp32 with `--accumulate-allreduce-grads-in-fp32`, and aliases it as `main_grad`; the post-reduce hook drops the alias once the reduce-scatter has taken the gradient. flex_shard itself knows nothing about `main_grad`. The fused GEMMs therefore add into the gradient FlexShard reduce-scatters, across microbatches with no-sync, with no separate buffer or copy. Megatron's own linear layer captures `main_grad` at forward, so its backward now keeps a `main_grad` attached after forward instead of resetting it to forward's `None`. The embedding and final-norm buckets keep ordinary autograd gradients.
+- **Tied embeddings.** The output layer reuses the embedding's weight at call time and registers none, so FlexShard cannot see that use from parameter names. When the model ties them, the wrapper puts the final norm's parameters into the embedding bucket, as torchtitan groups `[tok_embeddings, norm, lm_head]` for FSDP2. Their deepest common module is the model root, which also runs the output layer, so FlexShard hooks the bucket there: it gathers before the embedding, stays gathered through the output layer, re-gathers at the start of backward, and reduce-scatters after both uses' gradients have accumulated. The wrapper asserts that anchor, since FlexShard, like FSDP2, cannot detect call-time tying. The bucket skips reshard-after-forward, which at the root would free the weight right before backward re-gathers it. With fusion, the bucket gets the `main_grad` hooks, whose pre-backward hook now runs before the output layer's fused GEMM.
 
 ### Limitations
 
@@ -251,9 +251,7 @@ After Phases A and B, in order of benchmarking value:
    - Still to do: loss curves at TP 4 × DP 2, and the 7.2B model benchmark at TP 2 × DP 4, including whether FlexShard needs `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` now supports it (see [Design](#design)), and on the 117M model iteration-1 loss and grad norm match Megatron exactly with fusion on both sides.
    - Still to do: benchmark Megatron and FlexShard with fusion on the 1.4B and 7.2B models. The benchmarks so far turned fusion off on both sides, partly because this environment lacks APEX's `fused_weight_gradient_mlp_cuda`, which Megatron's own linear layers need for fusion.
-3. **Tied embeddings.** `--use-flex-shard` requires `--untie-embeddings-and-output-weights`. This may be small:
-   - Keep the embedding bucket gathered through backward, so the output layer reads the gathered weight.
-   - Check that the grads from both uses accumulate before the reduce-scatter.
+3. **Tied embeddings.** `--use-flex-shard` now supports Megatron's default tied embedding and output weights (see [Design](#design)). On the 117M model, iteration-1 loss and grad norm match Megatron exactly at DP 4 and at TP 2 × DP 2 with sequence parallelism, with no-sync, fusion and multi-token prediction. The 1.4B model tracks Megatron over 500 iterations within its run-to-run spread.
 4. **Expert parallelism (MoE, Megatron vs FlexShard).**
    - Put expert params in buckets over the expert data-parallel group. FlexShard supports one mesh per bucket, as in its MoE example.
    - Dense params stay on the DP group, and the token dispatcher is untouched.

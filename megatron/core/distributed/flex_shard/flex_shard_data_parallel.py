@@ -63,6 +63,14 @@ class FlexShardDataParallel(_BaseDataParallel):
     the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
     gradient FlexShard reduce-scatters, across microbatches with no_sync.
 
+    With tied embeddings, the output layer reuses the embedding's weight at call time and
+    registers none, so FlexShard cannot see that use from parameter names. The final norm's
+    parameters join the embedding bucket, as torchtitan groups [tok_embeddings, norm, lm_head]
+    for FSDP2: their deepest common module is the model root, which also runs the output layer,
+    so the bucket's hooks gather the weight before every use and reduce-scatter it after all of
+    them. The bucket skips reshard-after-forward, which at the root would free the weight right
+    before backward re-gathers it.
+
     Args:
         config: Transformer config object.
         ddp_config: FlexShardDataParallelConfig object.
@@ -108,8 +116,18 @@ class FlexShardDataParallel(_BaseDataParallel):
         mp_policy = MixedPrecisionPolicy(
             reduce_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else None
         )
-        bucket_fqns = self._build_bucket_fqns()
-        fused_fqns = self._fused_wgrad_fqns() if config.gradient_accumulation_fusion else set()
+        tied = self._find_tied_output_weight()
+        bucket_fqns = self._build_bucket_fqns(tied)
+        tied_bucket = None
+        if tied is not None:
+            weight_fqn, output_layer_path = tied
+            tied_bucket = next(i for i, fqns in enumerate(bucket_fqns) if weight_fqn in fqns)
+            anchor = _common_module_path(bucket_fqns[tied_bucket])
+            assert anchor == "" or output_layer_path.startswith(anchor + "."), (
+                "FlexShard with tied embeddings needs the embedding bucket's hooks on a module "
+                f"that also runs the output layer, got {anchor!r} for {output_layer_path!r}."
+            )
+        fused_fqns = self._fused_wgrad_fqns(tied) if config.gradient_accumulation_fusion else set()
         uses_main_grad = [any(fqn in fused_fqns for fqn in fqns) for fqns in bucket_fqns]
         # Passed only where needed, so FlexShard without fusion still works with a flex_shard
         # that predates the hooks.
@@ -123,7 +141,9 @@ class FlexShardDataParallel(_BaseDataParallel):
                 mesh=self.device_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=(
-                    ddp_config.reshard_after_forward and i < len(bucket_fqns) - 1
+                    ddp_config.reshard_after_forward
+                    and i < len(bucket_fqns) - 1
+                    and i != tied_bucket
                 ),
                 **(main_grad_hooks if uses_main_grad[i] else {}),
             )
@@ -152,18 +172,42 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"no_sync={ddp_config.no_sync}, "
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
             f"main_grad buckets={sum(uses_main_grad)}, "
+            f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
 
-    def _fused_wgrad_fqns(self) -> Set[str]:
+    def _find_tied_output_weight(self) -> Optional[Tuple[str, str]]:
+        """``(weight FQN, output-layer path)`` if the output layer reuses the embedding weight."""
+        for name, submodule in self.module.named_modules():
+            if not (
+                getattr(submodule, "share_embeddings_and_output_weights", False)
+                and getattr(submodule, "pre_process", False)
+                and getattr(submodule, "post_process", False)
+            ):
+                continue
+            weight = submodule.shared_embedding_or_output_weight()
+            weight_fqn = next(
+                fqn for fqn, param in self.module.named_parameters() if param is weight
+            )
+            return weight_fqn, f"{name}.output_layer" if name else "output_layer"
+        return None
+
+    def _fused_wgrad_fqns(self, tied: Optional[Tuple[str, str]]) -> Set[str]:
         """FQNs of parameters whose modules add weight gradients into ``main_grad``."""
-        return {
+        fqns = {
             f"{name}.{param_name}" if name else param_name
             for name, submodule in self.module.named_modules()
             if getattr(submodule, "fuse_wgrad_accumulation", False)
             or getattr(submodule, "gradient_accumulation_fusion", False)
             for param_name, _ in submodule.named_parameters(recurse=False)
         }
+        if tied is not None:
+            weight_fqn, output_layer_path = tied
+            output_layer = self.module.get_submodule(output_layer_path)
+            if getattr(output_layer, "gradient_accumulation_fusion", False):
+                # The output layer adds the tied weight's gradient into main_grad.
+                fqns.add(weight_fqn)
+        return fqns
 
     def _alias_main_grads(self, named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
         """FlexShard pre-backward hook: expose each gathered parameter's gradient as main_grad.
@@ -187,7 +231,7 @@ class FlexShardDataParallel(_BaseDataParallel):
         for _, param in named_params:
             vars(param).pop("main_grad", None)
 
-    def _build_bucket_fqns(self) -> List[List[str]]:
+    def _build_bucket_fqns(self, tied: Optional[Tuple[str, str]]) -> List[List[str]]:
         """Group parameter FQNs into buckets in forward (module registration) order."""
         params = dict(self.module.named_parameters())
         claimed = set()
@@ -207,6 +251,22 @@ class FlexShardDataParallel(_BaseDataParallel):
             if fqns:
                 buckets.append(fqns)
         assert claimed == set(params), f"Unbucketed parameters: {set(params) - claimed}"
+
+        if tied is not None:
+            # The final norm joins the embedding bucket, so the bucket's common module, where
+            # FlexShard hooks it, is the model root that also runs the output layer.
+            weight_fqn, output_layer_path = tied
+            norm_prefix = output_layer_path[: -len("output_layer")] + "decoder.final_layernorm."
+            embedding = next(fqns for fqns in buckets if weight_fqn in fqns)
+            norms = [fqns for fqns in buckets if fqns[0].startswith(norm_prefix)]
+            if not norms:
+                raise ValueError(
+                    "FlexShard with tied embeddings groups the final norm with the embedding, "
+                    f"but found no parameters under {norm_prefix!r}."
+                )
+            for fqns in norms:
+                embedding.extend(fqns)
+                buckets.remove(fqns)
 
         # FlexShard requires one parameter dtype per bucket.
         split_buckets = []
@@ -240,3 +300,13 @@ class FlexShardDataParallel(_BaseDataParallel):
         No-op: FlexShard waits for all reduce-scatters at the end of backward.
         """
         pass
+
+
+def _common_module_path(fqns: List[str]) -> str:
+    """Deepest module path that contains every parameter in ``fqns``."""
+    common: List[str] = []
+    for parts in zip(*(fqn.split(".")[:-1] for fqn in fqns)):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    return ".".join(common)
