@@ -423,6 +423,16 @@ def combined_forward_backward_step(
                     forward_fsdp_wrapper.post_backward_release_module,
                 )
 
+        from megatron.core.distributed.flex_shard import FlexShardDataParallel
+
+        if isinstance(f_model, FlexShardDataParallel):
+            # Finish each layer's FlexShard buckets once its backward, including backward_dw(),
+            # is done, so the reduce-scatters in the step's last backward overlap earlier layers.
+            for i in range(f_schedule_plan.num_layers()):
+                f_schedule_plan.get_layer(i).set_fsdp_reshard_hooks(
+                    lambda module: None, f_model.finish_layer_backward
+                )
+
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
     b_schedule_plan = None

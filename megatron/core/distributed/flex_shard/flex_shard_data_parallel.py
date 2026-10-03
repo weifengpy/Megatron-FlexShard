@@ -195,9 +195,29 @@ class FlexShardDataParallel(_BaseDataParallel):
         )
         params = dict(self.module.named_parameters())
         is_expert = [_is_expert_param(params[fqns[0]]) for fqns in bucket_fqns]
-        # Passed only where needed, so FlexShard without delayed weight gradients still works
-        # with a flex_shard that predates defer_post_backward.
-        deferred = [any(fqn in delayed_fqns for fqn in fqns) for fqns in bucket_fqns]
+        # With the EP overlap schedule, a TransformerLayer's buckets (its dense parameters and its
+        # experts) finish from the schedule's per-layer post-backward hook (finish_layer_backward),
+        # after the layer's last backward step or its backward_dw(), so the reduce-scatters in
+        # the step's last backward overlap the layers before.
+        layer_buckets = {
+            name: [i for i, fqns in enumerate(bucket_fqns) if fqns[0].startswith(name + ".")]
+            for name, submodule in self.module.named_modules()
+            if isinstance(submodule, TransformerLayer)
+        }
+        self._layer_bucket_fqns = {}
+        if config.overlap_moe_expert_parallel_comm:
+            self._layer_bucket_fqns = {
+                id(self.module.get_submodule(name)): [bucket_fqns[i][0] for i in idxs]
+                for name, idxs in layer_buckets.items()
+            }
+        in_layer = {i for idxs in layer_buckets.values() for i in idxs}
+        # Passed only where needed, so FlexShard without delayed weight gradients or the EP
+        # overlap still works with a flex_shard that predates defer_post_backward.
+        deferred = [
+            any(fqn in delayed_fqns for fqn in fqns)
+            or (config.overlap_moe_expert_parallel_comm and i in in_layer)
+            for i, fqns in enumerate(bucket_fqns)
+        ]
         self.buckets = [
             BucketSpec(
                 fqns,
@@ -324,6 +344,13 @@ class FlexShardDataParallel(_BaseDataParallel):
         self.module.unshard()
         for fqns in self._main_grad_bucket_fqns:
             self._alias_main_grads([(fqn, self.module.get_parameter(fqn)) for fqn in fqns])
+
+    def finish_layer_backward(self, layer: torch.nn.Module) -> None:
+        """The EP overlap schedule's per-layer post-backward hook: the layer's backward,
+        including its delayed weight gradients, is done, so finish its buckets, which
+        reduce-scatters them in the step's last backward."""
+        for fqn in self._layer_bucket_fqns.get(id(layer), ()):
+            self.module.finish_deferred_backward(self.module.get_parameter(fqn))
 
     def _finish_deferred_backward(self, fqn: str) -> None:
         """post_wgrad_grad_acc_hook of a delayed weight: backward_dw() has computed its bucket's
