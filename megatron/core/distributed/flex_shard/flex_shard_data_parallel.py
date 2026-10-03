@@ -127,7 +127,7 @@ class FlexShardDataParallel(_BaseDataParallel):
         ]
         if ddp_config.grad_reduce_in_fp32:
             # FlexShard stores each local shard's gradient in the parameter's grad_dtype
-            # (flex_shard#20), so bf16 parameters get fp32 shard gradients, which the
+            # (flex_shard#23), so bf16 parameters get fp32 shard gradients, which the
             # mixed-precision optimizer then uses as main gradients without a copy.
             for param in self.module.parameters():
                 if param.is_floating_point() and param.dtype != torch.float32:
