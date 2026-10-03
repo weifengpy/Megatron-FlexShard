@@ -111,6 +111,11 @@ class FlexShardDataParallel(_BaseDataParallel):
         bucket_fqns = self._build_bucket_fqns()
         fused_fqns = self._fused_wgrad_fqns() if config.gradient_accumulation_fusion else set()
         uses_main_grad = [any(fqn in fused_fqns for fqn in fqns) for fqns in bucket_fqns]
+        # Passed only where needed, so FlexShard without fusion still works with a flex_shard
+        # that predates the hooks.
+        main_grad_hooks = dict(
+            pre_backward_hook=self._alias_main_grads, post_reduce_hook=self._drop_main_grads
+        )
         self.buckets = [
             BucketSpec(
                 fqns,
@@ -120,8 +125,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 reshard_after_forward=(
                     ddp_config.reshard_after_forward and i < len(bucket_fqns) - 1
                 ),
-                pre_backward_hook=self._alias_main_grads if uses_main_grad[i] else None,
-                post_reduce_hook=self._drop_main_grads if uses_main_grad[i] else None,
+                **(main_grad_hooks if uses_main_grad[i] else {}),
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
