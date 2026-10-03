@@ -251,8 +251,7 @@ After Phases A and B, in order of benchmarking value:
    - Still to do: loss curves at TP 4 × DP 2, and the 7.2B model benchmark at TP 2 × DP 4, including whether FlexShard needs `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` now supports it (see [Design](#design)), and on the 117M model iteration-1 loss and grad norm match Megatron exactly with fusion on both sides.
    - Still to do: benchmark Megatron and FlexShard with fusion on the 1.4B and 7.2B models. The benchmarks so far turned fusion off on both sides, partly because this environment lacks APEX's `fused_weight_gradient_mlp_cuda`, which Megatron's own linear layers need for fusion.
-3. **Tied embeddings.** `--use-flex-shard` now supports Megatron's default tied embedding and output weights (see [Design](#design)). On the 117M model, iteration-1 loss and grad norm match Megatron exactly with fusion off and on, and with reshard-after-forward on for the other buckets.
-   - Still to do: the 1.4B model over ~500 iterations, TP 2 × DP 2, and multi-token prediction.
+3. **Tied embeddings.** `--use-flex-shard` now supports Megatron's default tied embedding and output weights (see [Design](#design)). On the 117M model, iteration-1 loss and grad norm match Megatron exactly at DP 4 and at TP 2 × DP 2 with sequence parallelism, with no-sync, fusion and multi-token prediction. The 1.4B model tracks Megatron over 500 iterations within its run-to-run spread.
 4. **Expert parallelism (MoE, Megatron vs FlexShard).**
    - Put expert params in buckets over the expert data-parallel group. FlexShard supports one mesh per bucket, as in its MoE example.
    - Dense params stay on the DP group, and the token dispatcher is untouched.
