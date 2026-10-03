@@ -1077,6 +1077,14 @@ def validate_args(args, defaults={}):
             '--use-flex-shard is not supported with --delay-wgrad-compute'
         assert not args.overlap_moe_expert_parallel_comm, \
             '--use-flex-shard is not supported with --overlap-moe-expert-parallel-comm'
+        # Without fusion, TransformerEngine's backward_dw() assigns delayed weight gradients to
+        # param.grad, which would overwrite the gradients FlexShard accumulates there without sync.
+        assert not (
+            args.overlap_dispatch_backward_with_experts_wgrad
+            and args.flex_shard_no_sync
+            and not args.gradient_accumulation_fusion
+        ), ('--use-flex-shard with --overlap-dispatch-backward-with-experts-wgrad and '
+            '--flex-shard-no-sync needs gradient accumulation fusion')
         # FlexShard replaces parameters with plain local-shard tensors, which would drop
         # TransformerEngine's GroupedTensor parameter storage.
         assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
