@@ -1073,8 +1073,16 @@ def validate_args(args, defaults={}):
             '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-flex-shard is not supported with pipeline parallelism'
-        assert args.expert_model_parallel_size == 1, \
-            '--use-flex-shard is not supported with expert parallelism'
+        # FlexShard reduce-scatters each bucket's gradients when its backward ends, before
+        # TransformerEngine's delayed backward_dw() would add the weight gradients.
+        assert not args.delay_wgrad_compute, \
+            '--use-flex-shard is not supported with --delay-wgrad-compute'
+        assert not args.overlap_moe_expert_parallel_comm, \
+            '--use-flex-shard is not supported with --overlap-moe-expert-parallel-comm'
+        # FlexShard replaces parameters with plain local-shard tensors, which would drop
+        # TransformerEngine's GroupedTensor parameter storage.
+        assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
+            '--use-flex-shard does not support single grouped MoE weights or biases'
         assert not args.use_distributed_optimizer, \
             "--use-flex-shard is not supported with MCore's distributed optimizer"
         assert not args.overlap_param_gather, \
