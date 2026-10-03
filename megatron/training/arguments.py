@@ -2087,6 +2087,13 @@ def validate_args(args, defaults={}):
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
             )
+    if args.overlap_dispatch_backward_with_experts_wgrad and args.overlap_grad_reduce:
+        # DDP marks the delayed expert weight gradients ready from TransformerEngine's hooks, as
+        # with --delay-wgrad-compute (get_megatron_ddp_config).
+        assert is_te_min_version("2.8.0"), (
+            "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling "
+            "overlap_dispatch_backward_with_experts_wgrad"
+        )
 
     if args.fine_grained_activation_offloading:
         assert args.transformer_impl == 'transformer_engine', \
