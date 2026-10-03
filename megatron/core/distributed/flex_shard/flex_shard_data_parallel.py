@@ -71,6 +71,14 @@ class FlexShardDataParallel(_BaseDataParallel):
     them. The bucket skips reshard-after-forward, which at the root would free the weight right
     before backward re-gathers it.
 
+    With expert parallelism, expert parameters (``allreduce=False``) exist only on their EP rank
+    and are replicated over the expert data-parallel group, so each MoE layer's experts get
+    their own bucket on that group, hooked on the experts module, as Megatron DDP keeps them in
+    separate buffers. Each expert's gradient already sums the tokens its EP peers routed to it,
+    so its bucket divides by the dense data-parallel size, not its own group's (Megatron DDP's
+    expert gradient scaling, FSDP2's gradient divide factor). With per-token loss, every bucket
+    sums instead, and finalize_model_grads divides by the global token count.
+
     Args:
         config: Transformer config object.
         ddp_config: FlexShardDataParallelConfig object.
@@ -106,6 +114,16 @@ class FlexShardDataParallel(_BaseDataParallel):
         self.device_mesh = DeviceMesh.from_group(
             self.process_group, "cuda", mesh_dim_names=("dp",)
         )
+        self.expert_process_group = None
+        self.expert_device_mesh = None
+        if any(_is_expert_param(param) for param in self.module.parameters()):
+            self.expert_process_group = getattr(pg_collection, "expt_dp", None)
+            if self.expert_process_group is None:
+                # Migration fallback for callers that do not pass process groups.
+                self.expert_process_group = parallel_state.get_expert_data_parallel_group()
+            self.expert_device_mesh = DeviceMesh.from_group(
+                self.expert_process_group, "cuda", mesh_dim_names=("edp",)
+            )
 
         # FlexShard replaces each parameter with a local-shard tensor, dropping the Megatron
         # attributes (tensor_model_parallel, allreduce, ...) the optimizer relies on.
@@ -134,17 +152,20 @@ class FlexShardDataParallel(_BaseDataParallel):
         main_grad_hooks = dict(
             pre_backward_hook=self._alias_main_grads, post_reduce_hook=self._drop_main_grads
         )
+        params = dict(self.module.named_parameters())
+        is_expert = [_is_expert_param(params[fqns[0]]) for fqns in bucket_fqns]
         self.buckets = [
             BucketSpec(
                 fqns,
                 placement_fn=per_param_placements,
-                mesh=self.device_mesh,
+                mesh=self.expert_device_mesh if is_expert[i] else self.device_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=(
                     ddp_config.reshard_after_forward
                     and i < len(bucket_fqns) - 1
                     and i != tied_bucket
                 ),
+                **self._gradient_reduction(config, is_expert[i]),
                 **(main_grad_hooks if uses_main_grad[i] else {}),
             )
             for i, fqns in enumerate(bucket_fqns)
@@ -167,7 +188,9 @@ class FlexShardDataParallel(_BaseDataParallel):
         log_single_rank(
             logger,
             logging.INFO,
-            f"FlexShard: {len(self.buckets)} buckets over {self.device_mesh.size()} ranks, "
+            f"FlexShard: {len(self.buckets) - sum(is_expert)} buckets over "
+            f"{self.device_mesh.size()} ranks, {sum(is_expert)} expert buckets over "
+            f"{self.expert_device_mesh.size() if self.expert_device_mesh else 0} ranks, "
             f"reshard_after_forward={ddp_config.reshard_after_forward}, "
             f"no_sync={ddp_config.no_sync}, "
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
@@ -175,6 +198,19 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
+
+    def _gradient_reduction(self, config: TransformerConfig, is_expert: bool) -> Dict:
+        """BucketSpec reduction arguments that scale gradients as Megatron DDP does."""
+        if config.calculate_per_token_loss:
+            # finalize_model_grads divides every gradient by the global token count.
+            return dict(gradient_reduce_op=torch.distributed.ReduceOp.SUM)
+        if is_expert and self.expert_device_mesh.size() != self.device_mesh.size():
+            # An expert's gradient already sums the tokens its EP peers routed to it, so the
+            # sum over the expert data-parallel group is divided by the dense data-parallel
+            # size. Passed only where needed, so FlexShard without expert parallelism still
+            # works with a flex_shard that predates gradient_divide_factor.
+            return dict(gradient_divide_factor=self.device_mesh.size())
+        return {}
 
     def _find_tied_output_weight(self) -> Optional[Tuple[str, str]]:
         """``(weight FQN, output-layer path)`` if the output layer reuses the embedding weight."""
@@ -268,13 +304,16 @@ class FlexShardDataParallel(_BaseDataParallel):
                 embedding.extend(fqns)
                 buckets.remove(fqns)
 
-        # FlexShard requires one parameter dtype per bucket.
+        # Expert parameters shard over the expert data-parallel group, so an MoE layer's
+        # experts get their own bucket after its other parameters; FlexShard also requires one
+        # parameter dtype per bucket.
         split_buckets = []
         for fqns in buckets:
-            by_dtype: Dict[torch.dtype, List[str]] = {}
+            groups: Dict[Tuple[bool, torch.dtype], List[str]] = {}
             for fqn in fqns:
-                by_dtype.setdefault(params[fqn].dtype, []).append(fqn)
-            split_buckets.extend(by_dtype.values())
+                key = (_is_expert_param(params[fqn]), params[fqn].dtype)
+                groups.setdefault(key, []).append(fqn)
+            split_buckets.extend(groups.values())
         return split_buckets
 
     @contextmanager
@@ -300,6 +339,11 @@ class FlexShardDataParallel(_BaseDataParallel):
         No-op: FlexShard waits for all reduce-scatters at the end of backward.
         """
         pass
+
+
+def _is_expert_param(param: torch.nn.Parameter) -> bool:
+    """Whether ``param`` uses the expert topology (EP/ETP/expert data parallelism)."""
+    return not getattr(param, "allreduce", True)
 
 
 def _common_module_path(fqns: List[str]) -> str:
