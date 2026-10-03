@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import logging
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Set, Tuple
@@ -80,7 +81,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     separate buffers. Each expert's gradient already sums the tokens its EP peers routed to it,
     so its bucket divides by the dense data-parallel size, not its own group's (Megatron DDP's
     expert gradient scaling, FSDP2's gradient divide factor). With per-token loss, every bucket
-    sums instead, and finalize_model_grads divides by the global token count.
+    sums instead, and finalize_model_grads divides by the global token count. With
+    TransformerEngine's delayed weight gradients (--overlap-dispatch-backward-with-experts-wgrad),
+    the experts' backward leaves their weight gradients to backward_dw(), which the token
+    dispatch's backward runs afterwards; their buckets defer FlexShard's post-backward until
+    Megatron calls the weights' post_wgrad_grad_acc_hook after backward_dw().
 
     With pipeline parallelism, each model chunk (one per virtual pipeline stage) is its own
     FlexShardDataParallel. Megatron's schedules run each microbatch's backward separately. With
@@ -138,6 +143,22 @@ class FlexShardDataParallel(_BaseDataParallel):
                 self.expert_process_group, "cuda", mesh_dim_names=("edp",)
             )
 
+        # TransformerEngine computes delayed weight gradients (delay_wgrad_compute, which marks
+        # their parameters skip_backward_post_hook) in backward_dw(), after the module's backward.
+        # Expert buckets, which FlexShard reduce-scatters once the experts' backward is done,
+        # defer that until Megatron runs each such parameter's post_wgrad_grad_acc_hook after
+        # backward_dw(). Set before the attributes are saved, so the local shards and FlexShard's
+        # unsharded parameters both carry it.
+        delayed_fqns = {
+            fqn
+            for fqn, param in self.module.named_parameters()
+            if getattr(param, "skip_backward_post_hook", False) and _is_expert_param(param)
+        }
+        for fqn in delayed_fqns:
+            self.module.get_parameter(fqn).post_wgrad_grad_acc_hook = functools.partial(
+                self._finish_deferred_backward, fqn
+            )
+
         # FlexShard replaces each parameter with a local-shard tensor, dropping the Megatron
         # attributes (tensor_model_parallel, allreduce, ...) the optimizer relies on.
         custom_attrs = {
@@ -167,6 +188,9 @@ class FlexShardDataParallel(_BaseDataParallel):
         )
         params = dict(self.module.named_parameters())
         is_expert = [_is_expert_param(params[fqns[0]]) for fqns in bucket_fqns]
+        # Passed only where needed, so FlexShard without delayed weight gradients still works
+        # with a flex_shard that predates defer_post_backward.
+        deferred = [any(fqn in delayed_fqns for fqn in fqns) for fqns in bucket_fqns]
         self.buckets = [
             BucketSpec(
                 fqns,
@@ -180,6 +204,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 ),
                 **self._gradient_reduction(config, is_expert[i]),
                 **(main_grad_hooks if uses_main_grad[i] else {}),
+                **(dict(defer_post_backward=True) if deferred[i] else {}),
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
@@ -210,6 +235,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"no_sync={ddp_config.no_sync}, "
             f"reshard_after_backward={ddp_config.reshard_after_backward}, "
             f"main_grad buckets={sum(uses_main_grad)}, "
+            f"deferred buckets={sum(deferred)}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )
@@ -278,6 +304,11 @@ class FlexShardDataParallel(_BaseDataParallel):
                 dtype = torch.float32 if self.ddp_config.grad_reduce_in_fp32 else param.dtype
                 param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
             param.main_grad = param.grad
+
+    def _finish_deferred_backward(self, fqn: str) -> None:
+        """post_wgrad_grad_acc_hook of a delayed weight: backward_dw() has computed its bucket's
+        weight gradients, so FlexShard can finish the bucket. Later calls for it do nothing."""
+        self.module.finish_deferred_backward(self.module.get_parameter(fqn))
 
     @staticmethod
     def _drop_main_grads(named_params: List[Tuple[str, torch.nn.Parameter]]) -> None:
