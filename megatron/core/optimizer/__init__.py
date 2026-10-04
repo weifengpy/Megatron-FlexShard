@@ -935,7 +935,17 @@ def _get_megatron_emerging_optimizer(
                 )
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
-            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+            # With FlexShard each gradient element lives on one rank (Muon matrices on their
+            # owner), so grad stats reduce over every rank, as for its Adam groups.
+            setattr(
+                optimizer,
+                'grad_stats_parallel_group',
+                (
+                    torch.distributed.group.WORLD
+                    if isinstance(model_chunks[0], FlexShardDataParallel)
+                    else model_parallel_group
+                ),
+            )
             tp_group = pg_collection.tp
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
