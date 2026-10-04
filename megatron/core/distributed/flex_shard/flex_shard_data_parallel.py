@@ -10,7 +10,7 @@ from torch.distributed import ProcessGroup
 
 try:
     from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
-    from flex_shard.custom_placements import Fp8BucketedBlockShard, MixedBucketPlacement
+    from flex_shard.custom_placements import MixedBucketPlacement
     from flex_shard.custom_placements.shard import per_param_placements
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -395,16 +395,12 @@ class FlexShardDataParallel(_BaseDataParallel):
 
     def _fp8_placement_fn(self, fp8_fqns: Set[str]):
         """Placements for a bucket with TransformerEngine blockwise FP8 weights: those
-        all-gather in FP8 (flex_shard's Fp8BucketedBlockShard with TransformerEngine's
-        quantizer), the rest Shard(0), all in one collective (MixedBucketPlacement)."""
+        all-gather in FP8 (te_fp8.TEBlockwiseFp8Shard, flex_shard's Fp8BucketedBlockShard
+        quantizing with TransformerEngine), the rest Shard(0), all in one collective
+        (MixedBucketPlacement)."""
 
         def placement_fn(named_params, mesh):
-            fp8 = Fp8BucketedBlockShard(
-                world_size=mesh.size(),
-                weight_factory=self._te_fp8.weight_factory,
-                block_size=te_fp8.BLOCK_SIZE,
-                quantizer=self._te_fp8,
-            )
+            fp8 = te_fp8.TEBlockwiseFp8Shard(world_size=mesh.size(), weights=self._te_fp8)
             fqns = [fqn for fqn, _ in named_params]
             if all(fqn in fp8_fqns for fqn in fqns):
                 return {fqn: (fp8,) for fqn in fqns}
