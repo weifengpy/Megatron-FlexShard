@@ -8,8 +8,9 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
 from flex_shard.custom_placements import (
+    BucketedOwned,
+    BucketedOwnedSegmentSpec,
     MixedBucketPlacement,
-    make_bucketed_owned_full_param_placement_fn,
 )
 from flex_shard.custom_placements.shard import per_param_placements
 from torch.distributed import ProcessGroup
@@ -111,11 +112,13 @@ class FlexShardDataParallel(_BaseDataParallel):
     shares that collective (te_fp8.py).
 
     With Muon (``ddp_config.own_matrices``), each bucket holding a Muon matrix stores every
-    parameter whole on one rank (flex_shard's BucketedOwned, owners balanced by size within the
-    bucket). The reduce-scatter delivers each matrix's whole gradient to its owner, where
-    Megatron's Muon orthogonalizes it with no optimizer communication; other ranks hold empty
-    (0, n) shards of it, which the optimizer steps as no-ops. The next forward's all-gather
-    carries the updated matrices, so there is no all-gather after the step.
+    parameter whole on one rank (flex_shard's BucketedOwned). Owners balance each rank's total
+    owned size, which its static memory follows, over all such buckets on a mesh
+    (_balanced_owners); balancing each bucket on its own would put a layer's largest matrix on the
+    same rank in every layer. The reduce-scatter delivers each matrix's whole gradient to its
+    owner, where Megatron's Muon orthogonalizes it with no optimizer communication; other ranks
+    hold empty (0, n) shards of it, which the optimizer steps as no-ops. The next forward's
+    all-gather carries the updated matrices, so there is no all-gather after the step.
 
     With TransformerEngine's single grouped MoE weights (--moe-single-grouped-weight), each
     grouped linear's ``GroupedTensor`` weight, which bans slicing, becomes a plain
@@ -245,6 +248,7 @@ class FlexShardDataParallel(_BaseDataParallel):
         assert not any(o and f for o, f in zip(owned, has_fp8)), (
             "FlexShard's whole-matrix buckets for Muon don't all-gather FP8 weights"
         )
+        owners = self._balance_owners(bucket_fqns, owned, is_expert, params)
         # With the EP overlap schedule, a TransformerLayer's buckets (its dense parameters and its
         # experts) finish from the schedule's per-layer post-backward hook (finish_layer_backward),
         # after the layer's last backward step or its backward_dw(), so the reduce-scatters in
@@ -274,11 +278,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 placement_fn=(
                     self._fp8_placement_fn(fp8_fqns)
                     if has_fp8[i]
-                    else (
-                        make_bucketed_owned_full_param_placement_fn()
-                        if owned[i]
-                        else per_param_placements
-                    )
+                    else (_owned_placement_fn(owners) if owned[i] else per_param_placements)
                 ),
                 mesh=self.expert_device_mesh if is_expert[i] else self.device_mesh,
                 mp_policy=mp_policy,
@@ -457,6 +457,26 @@ class FlexShardDataParallel(_BaseDataParallel):
             vars(param).pop("main_grad", None)
             te_fp8.drop_columnwise(param)
 
+    def _balance_owners(
+        self,
+        bucket_fqns: List[List[str]],
+        owned: List[bool],
+        is_expert: List[bool],
+        params: Dict[str, torch.nn.Parameter],
+    ) -> Dict[str, int]:
+        """The owner rank of every parameter in the owned buckets, balanced over the owned
+        buckets on each mesh."""
+        owners: Dict[str, int] = {}
+        for expert, mesh in ((False, self.device_mesh), (True, self.expert_device_mesh)):
+            buckets = [
+                [(fqn, params[fqn].numel()) for fqn in fqns]
+                for fqns, own, exp in zip(bucket_fqns, owned, is_expert)
+                if own and exp == expert
+            ]
+            if buckets:
+                owners.update(_balanced_owners(buckets, mesh.size()))
+        return owners
+
     def _fp8_placement_fn(self, fp8_fqns: Set[str]):
         """Placements for a bucket with TransformerEngine blockwise FP8 weights: those
         all-gather in FP8 (te_fp8.TEBlockwiseFp8Shard, flex_shard's Fp8BucketedBlockShard
@@ -587,6 +607,70 @@ def _is_muon_matrix(param: torch.nn.Parameter) -> bool:
         and getattr(param, "use_muon", True)
         and not getattr(param, "is_embedding_or_output_parameter", False)
     )
+
+
+def _balanced_owners(buckets: List[List[Tuple[str, int]]], num_ranks: int) -> Dict[str, int]:
+    """Owner ranks for parameters stored whole on one rank, given ``(fqn, numel)`` buckets.
+
+    Balances each rank's total owned size, which its local shards, fp32 main copies, gradients and
+    optimizer state all follow, over all the buckets: parameters from every bucket, largest first,
+    go to the rank with the least total so far. A bucket's collectives pad every rank's share to
+    the largest one, so a rank's share of a bucket is capped at the largest share that balancing
+    the bucket alone gives (largest first onto the least loaded rank, as flex_shard's
+    make_bucketed_owned_full_param_placement_fn does), and the padding never grows. torchtitan's
+    DistMuon (_balance_loads_across_partitions) balances each bucket first instead, and uses the
+    running totals only to break ties. Every rank computes the same owners.
+    """
+    caps = []
+    for bucket in buckets:
+        shares = [0] * num_ranks
+        for _, numel in sorted(bucket, key=lambda item: -item[1]):
+            shares[shares.index(min(shares))] += numel
+        caps.append(max(shares))
+    totals = [0] * num_ranks
+    shares = [[0] * num_ranks for _ in buckets]
+    owners = {}
+    for neg_numel, index, fqn in sorted(
+        (-numel, index, fqn) for index, bucket in enumerate(buckets) for fqn, numel in bucket
+    ):
+        numel, share = -neg_numel, shares[index]
+        fits = [rank for rank in range(num_ranks) if share[rank] + numel <= caps[index]]
+        rank = (
+            min(fits, key=lambda rank: (totals[rank], rank))
+            if fits
+            # Packing differently from the per-bucket balance can leave no rank room under the
+            # cap; the least filled rank then keeps the padding closest to it.
+            else min(range(num_ranks), key=lambda rank: (share[rank], totals[rank], rank))
+        )
+        owners[fqn] = rank
+        share[rank] += numel
+        totals[rank] += numel
+    return owners
+
+
+def _owned_placement_fn(owners: Dict[str, int]):
+    """flex_shard's whole-parameter BucketedOwned placement
+    (make_bucketed_owned_full_param_placement_fn), with the given owner ranks."""
+
+    def placement_fn(named_params, mesh):
+        placement = BucketedOwned(
+            {
+                fqn: [
+                    BucketedOwnedSegmentSpec(
+                        name=f"{fqn}#full",
+                        fqn=fqn,
+                        param_offset=0,
+                        numel=param.numel(),
+                        owner_rank=owners[fqn],
+                        storage_order=order,
+                    )
+                ]
+                for order, (fqn, param) in enumerate(named_params)
+            }
+        )
+        return {fqn: (placement,) for fqn, _ in named_params}
+
+    return placement_fn
 
 
 def _common_module_path(fqns: List[str]) -> str:
