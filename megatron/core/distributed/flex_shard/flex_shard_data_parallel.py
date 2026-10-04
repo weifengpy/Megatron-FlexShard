@@ -20,7 +20,7 @@ from ...transformer.transformer_config import TransformerConfig
 from ...transformer.transformer_layer import TransformerLayer
 from ...utils import log_single_rank
 from ..data_parallel_base import _BaseDataParallel
-from . import te_fp8
+from . import checkpoint_adapter, te_fp8
 from .flex_shard_data_parallel_config import FlexShardDataParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     all-gather in 128 x 128 blockwise FP8, quantized by TransformerEngine's own weight quantizer,
     and their layers receive the gathered ``Float8BlockwiseQTensor``; the rest of each bucket
     shares that collective (te_fp8.py).
+
+    Checkpoints (``--ckpt-format torch_dist``) have Megatron DDP's keys and global shapes: the
+    module's own ``sharded_state_dict()`` runs on meta stand-ins of the full parameters, and each
+    entry is cut down to the chunks of the local shard that flex_shard's layouts describe
+    (checkpoint_adapter.py).
 
     Args:
         config: Transformer config object.
@@ -451,6 +456,14 @@ class FlexShardDataParallel(_BaseDataParallel):
                 groups.setdefault(key, []).append(fqn)
             split_buckets.extend(groups.values())
         return split_buckets
+
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple = (), metadata=None):
+        """The wrapped module's sharded state dict, of FlexShard's local shards, with Megatron
+        DDP's keys and global shapes (checkpoint_adapter.py). MegatronModule's default would
+        prefix every key with 'module.'."""
+        return checkpoint_adapter.flex_shard_sharded_state_dict(
+            self.module, prefix, sharded_offsets, metadata
+        )
 
     @contextmanager
     def no_sync(self):

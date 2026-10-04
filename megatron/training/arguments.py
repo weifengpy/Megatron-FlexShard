@@ -1130,6 +1130,14 @@ def validate_args(args, defaults={}):
                 'all-gather bf16 parameters instead, turning off fp4_param_gather',
                 args.rank,
             )
+        # Checkpoints cut Megatron's torch_dist pieces down to FlexShard's local chunks
+        # (megatron/core/distributed/flex_shard/checkpoint_adapter.py).
+        if args.save or args.load:
+            assert args.ckpt_format == 'torch_dist', \
+                '--use-flex-shard saves and loads only --ckpt-format torch_dist'
+            # Its FP8 placement doesn't describe where its block rows sit yet.
+            assert not args.flex_shard_fp8_param_gather, \
+                '--use-flex-shard does not save or load with --fp8-param-gather yet'
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
