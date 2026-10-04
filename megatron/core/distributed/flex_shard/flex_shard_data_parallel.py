@@ -26,7 +26,7 @@ from ...transformer.transformer_config import TransformerConfig
 from ...transformer.transformer_layer import TransformerLayer
 from ...utils import log_single_rank
 from ..data_parallel_base import _BaseDataParallel
-from . import te_fp8
+from . import te_fp8, te_grouped
 from .flex_shard_data_parallel_config import FlexShardDataParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,12 @@ class FlexShardDataParallel(_BaseDataParallel):
     and their layers receive the gathered ``Float8BlockwiseQTensor``; the rest of each bucket
     shares that collective (te_fp8.py).
 
+    With TransformerEngine's single grouped MoE weights (--moe-single-grouped-weight), each
+    grouped linear's ``GroupedTensor`` weight, which bans slicing, becomes a plain
+    (experts * out, in) parameter over the same buffer before FlexShard shards it, and the layer
+    wraps FlexShard's gathered tensor back into a ``GroupedTensor`` every forward, with no copy
+    (te_grouped.py).
+
     Args:
         config: Transformer config object.
         ddp_config: FlexShardDataParallelConfig object.
@@ -133,6 +139,8 @@ class FlexShardDataParallel(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
         self.ddp_config = ddp_config
+        # Before anything reads the parameters: FlexShard shards plain tensors.
+        num_grouped = te_grouped.unwrap_single_grouped_params(self.module)
 
         if process_group is not None:
             self.process_group = process_group
@@ -295,6 +303,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"main_grad buckets={sum(uses_main_grad)}, "
             f"deferred buckets={sum(deferred)}, "
             f"fp8 weights={len(fp8_fqns)}, "
+            f"single grouped params={num_grouped}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
         )

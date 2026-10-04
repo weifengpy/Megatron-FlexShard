@@ -1094,10 +1094,22 @@ def validate_args(args, defaults={}):
             and not args.gradient_accumulation_fusion
         ), ('--use-flex-shard with --overlap-dispatch-backward-with-experts-wgrad and '
             '--flex-shard-no-sync needs gradient accumulation fusion')
-        # FlexShard replaces parameters with plain local-shard tensors, which would drop
-        # TransformerEngine's GroupedTensor parameter storage.
-        assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
-            '--use-flex-shard does not support single grouped MoE weights or biases'
+        # Single grouped MoE weights: FlexShard shards a plain parameter over TransformerEngine's
+        # GroupedTensor buffer and views it as a GroupedTensor every forward (te_grouped.py).
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # The op fuser registers the GroupedTensor parameter on its own module.
+            assert not args.use_transformer_engine_op_fuser, (
+                '--use-flex-shard with single grouped MoE weights does not support the '
+                'TransformerEngine op fuser')
+            # Quantized grouped storage (MXFP8, NVFP4) also owns scales FlexShard doesn't shard.
+            assert not (args.fp8 or args.fp4), (
+                '--use-flex-shard supports single grouped MoE weights only with bf16 weights')
+            # Without fusion, TransformerEngine's backward_dw() assigns the delayed weight
+            # gradient to the GroupedTensor view, not to the parameter FlexShard reduces.
+            assert args.gradient_accumulation_fusion or not (
+                args.delay_wgrad_compute or args.overlap_dispatch_backward_with_experts_wgrad
+            ), ('--use-flex-shard with single grouped MoE weights and delayed weight gradients '
+                'needs gradient accumulation fusion')
         assert not args.use_distributed_optimizer, \
             "--use-flex-shard is not supported with MCore's distributed optimizer"
         assert not args.overlap_param_gather, \

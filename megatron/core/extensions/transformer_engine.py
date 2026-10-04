@@ -2912,6 +2912,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return out
             return out, None
 
+        def _get_weight_tensors(self):
+            # FlexShard replaces a single grouped weight with a plain parameter and records how
+            # to view it as the GroupedTensor the grouped GEMM needs
+            # (megatron/core/distributed/flex_shard/te_grouped.py).
+            views = getattr(self, "grouped_param_views", {})
+            if "weight" in views:
+                return [views["weight"](self.weight)]
+            return super()._get_weight_tensors()
+
+        def _get_bias_tensors(self):
+            views = getattr(self, "grouped_param_views", {})
+            if "bias" in views:
+                return [views["bias"](self.bias)]
+            return super()._get_bias_tensors()
+
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
