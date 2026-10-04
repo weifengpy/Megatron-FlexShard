@@ -289,8 +289,13 @@ class FlexShardDataParallel(_BaseDataParallel):
                 ),
                 **self._gradient_reduction(config, is_expert[i]),
                 **(main_grad_hooks if uses_main_grad[i] else {}),
-                # FP8 weights also drop the column-wise data derived for backward (te_fp8.py).
-                **(dict(post_reduce_hook=self._after_reduce) if has_fp8[i] else {}),
+                # FP8 weights also drop the column-wise data derived for backward (te_fp8.py),
+                # which _after_reduce does, so buckets that have it for main_grad already do.
+                **(
+                    dict(post_reduce_hook=self._after_reduce)
+                    if has_fp8[i] and not uses_main_grad[i]
+                    else {}
+                ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
             )
             for i, fqns in enumerate(bucket_fqns)
