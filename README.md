@@ -90,13 +90,18 @@ Without TransformerEngine, use `--transformer-impl local` together with:
 - **Checkpoints** need `--ckpt-format torch_dist`, and don't support FP8 parameter all-gather yet, whose placement doesn't describe where its block rows sit, or single grouped MoE biases, which Megatron splits into per-expert rows with `unbind`.
 - **`torch.compile`:** FlexShard falls back to synchronous unshard under compile, so it is not used here.
 
-## Benchmark: Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward
+## Benchmark: Megatron vs FlexShard
 
-The goal is an apples-to-apples comparison between Megatron's data-parallel baseline and FlexShard configured to behave like it. AdamW comes first (Phase A), then Muon (Phase B). The [Plan](#plan) lists the steps; the results so far come first.
+The comparison runs in four phases (see the [Plan](#plan)):
+- **Phases A and B** compare Megatron DDP with FlexShard configured to behave like it, apples to apples: Phase A with AdamW, Phase B with Muon.
+- **Phase C** brings in Megatron-FSDP, against FlexShard with reshard-after-forward.
+- **Phase D** brings in the experimental Megatron-FSDP v2.
+
+The method and the Phase A and B results so far come first.
 
 ### Method
 
-The baseline is **Megatron DDP with the distributed optimizer** (`--use-distributed-optimizer`, ZeRO-1):
+For Phases A and B, the baseline is **Megatron DDP with the distributed optimizer** (`--use-distributed-optimizer`, ZeRO-1):
 - It keeps full bf16 params during forward and backward.
 - It shards the optimizer state.
 - Per step, it reduce-scatters the gradients once and all-gathers the params once.
@@ -125,7 +130,7 @@ FlexShard's fp32 shard grads need flex_shard #23 (see [Requirements](#requiremen
 
 Reference setups (not part of the goal):
 - **Megatron DDP** without the distributed optimizer, to show what the distributed optimizer adds.
-- **FlexShard with reshard-after-forward** (ZeRO-3, the `--use-flex-shard` default) and **Megatron-FSDP** (`optim_grads_params`). These trade communication for memory that the baseline doesn't save, so they are compared only with each other (see the [Roadmap](#roadmap)).
+- **FlexShard with reshard-after-forward** (ZeRO-3, the `--use-flex-shard` default). It trades communication for memory that the baseline doesn't save; its counterpart, Megatron-FSDP, comes in [Phase C](#phase-c-megatron-fsdp-vs-flexshard-with-reshard-after-forward).
 
 Setup:
 - 8x H100 96 GB, DP = 8, TP = PP = 1.
@@ -153,9 +158,8 @@ These were measured with FlexShard before flex_shard #16 and with bf16 FlexShard
   - Megatron vs FlexShard: 495.8 vs 545.3 ms (+10%) on the 1.4B model, 1824.4 vs 2006.2 ms (+10%) on the 7.2B model.
   - FlexShard's extra cost per microbatch on the 1.4B model (+17 ms) matches its exposed reduce-scatter.
   - See [Gradient accumulation with no-sync](#gradient-accumulation-with-no-sync-transformerengine-14b-model-dp--4) for the fix.
-- **ZeRO-3 pair, 1 microbatch:** FlexShard with reshard-after-forward vs Megatron-FSDP is 179.9 vs 164.1 ms on the 1.4B model and 649.6 vs 533.0 ms on the 7.2B model, with similar memory.
 - **Correctness:**
-  - Iteration-1 loss and grad norm are bit-identical across all five setups with the local spec: Megatron DDP, Megatron with the distributed optimizer, Megatron-FSDP, and FlexShard with and without reshard-after-forward.
+  - Iteration-1 loss and grad norm are bit-identical with the local spec across Megatron DDP, Megatron with the distributed optimizer, and FlexShard with and without reshard-after-forward.
   - With the TransformerEngine spec, they are bit-identical across Megatron with the distributed optimizer and both FlexShard setups.
   - A 4-layer model tracks over 20 iterations (loss 2.357658 vs 2.357765).
   - The 1.4B and 7.2B models diverge after ~iteration 5 in every setup, Megatron DDP vs Megatron with the distributed optimizer included, because lr 3e-4 is unstable for them.
@@ -195,9 +199,9 @@ Setup:
 
 ### Plan
 
-#### Phase A: AdamW
+#### Phase A: AdamW, Megatron DDP vs FlexShard
 
-Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward.
+Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward, both with Adam.
 
 1. **Matched configuration.** Use the [Method](#method) table. This needs flex_shard #23 for fp32 shard grads, and #20 and #21 to keep their casts cheap. The Megatron side is already in: `--accumulate-allreduce-grads-in-fp32` (the bf16 default) gives bf16 params fp32 shard grads.
 2. **Correctness gate.**
@@ -206,7 +210,7 @@ Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward.
    - Run the Megatron baseline twice for the noise floor, since TransformerEngine kernels are not bit-deterministic.
    - FlexShard passes if its loss and grad norm stay within the spread between the two Megatron runs.
 3. **Performance.**
-   - Cover both models at 1, 2 and 8 microbatches with the TransformerEngine spec, and also seq 4096.
+   - Cover both models at 1, 2 and 8 microbatches with the TransformerEngine spec, and also seq 4096, with gradient accumulation fusion, Megatron's default, on both sides.
    - For each cell, take the median ms/it over iterations ≥ 20. Report the min and median of at least 3 interleaved repetitions, plus peak allocated memory.
    - Run on a quiet node, or report GPU kernel time when the node is busy.
    - Profile one step per setup for exposed NCCL time and gaps, including Megatron on the 7.2B model, where it was slower than both FlexShard setups.
@@ -214,20 +218,21 @@ Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward.
    - Make one targeted fix per FlexShard shortfall, e.g. prefetch depth, or bucket size against Megatron's `--ddp-bucket-size` 20/40/80M with nccl-tests at both sizes.
    - Record the final numbers here.
 
-#### Phase B: Muon
+#### Phase B: Muon, Megatron DDP vs FlexShard
 
-Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `reshard_after_forward=False`.
+Megatron DDP + layer-wise distributed Muon vs FlexShard without reshard-after-forward. Both run Megatron's own Muon (`TensorParallelMuon` on Emerging-Optimizers) on whole matrices, so they compute the same update.
 
-| | Megatron layer-wise Muon | FlexShard + DistMuon |
+| | Megatron DDP + layer-wise distributed Muon | FlexShard without reshard-after-forward |
 | --- | --- | --- |
-| Wiring | `--optimizer muon --use-distributed-optimizer --muon-scalar-optimizer adam` → `LayerWiseDistributedOptimizer` | owned buckets from flex_shard's `materialize_dist_muon_buckets` + `build_local_dist_muon(DistMuon)` (torchtitan `torchtitan/distributed/flex_shard/dist_muon.py`) |
-| Ownership | whole matrices, LPT bin-packing per bucket | whole matrices / block groups, `assign_matrices` |
-| Communication per step | Reduce-scatter of grads to the owning ranks + all-gather of params | All-gather of params in forward + reduce-scatter of grads to the owning ranks |
-| Optimizer communication | none | none (storage layout == compute layout) |
-| Uneven shards | padded to the largest owner | padded to the largest owner |
-| Non-matrix params | Adam | Adam on `Shard(0)` buckets |
+| Flags | `--optimizer muon --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather` → `LayerWiseDistributedOptimizer` | `--use-flex-shard --flex-shard-no-reshard-after-forward --optimizer muon`, plus `--flex-shard-no-sync --flex-shard-no-reshard-after-backward` with gradient accumulation |
+| Ownership | each parameter whole in one rank's chunk of a DDP bucket, bin-packed by Newton-Schulz cost | each parameter of a bucket holding a Muon matrix whole on one rank (`BucketedOwned`), balanced by size over all such buckets |
+| Communication per step | Reduce-scatter of grads to the owners + all-gather of params after the step, overlapped with the next forward | All-gather per bucket in the first forward + reduce-scatter of grads to the owners per bucket in the last backward |
+| Optimizer step | Newton-Schulz on the owner, with no communication at TP 1 | Same |
+| Padding | each rank's chunk padded to the bucket's largest; buckets span many layers | each rank's share padded to the bucket's largest; one bucket per layer |
+| Non-matrix params | Adam, through the regular distributed optimizer | Adam, on their local shards |
 
 - Megatron's layer-wise Muon reduce-scatters to the owning ranks by default (`use_layer_wise_param_layout=True`); the class docstring's all-reduce flow is the legacy path. It needs `emerging_optimizers` `v0.3.0`.
+- torchtitan's DistMuon computes a different update (Nesterov, a single Newton-Schulz coefficient set, the update scale, bf16 normalization, per-head QKV), so FlexShard runs Megatron's optimizer instead.
 - The two AdamW setups from Phase A serve as references. Comparing each stack's Muon-minus-AdamW difference isolates the cost of switching from Adam to Muon in that stack.
 - Status: `--use-flex-shard` runs `--optimizer muon` (see [Design](#design)), with Emerging-Optimizers v0.3.0, Megatron's pin.
    - 117M model at DP 8: iteration-1 loss and grad norm match Megatron's layer-wise distributed Muon exactly, and iterations 2–10 stay within its run-to-run spread, without reshard-after-forward (no-sync; max loss difference 1.4e-4, against 9.5e-5 between two Megatron runs) and with it (1.5e-4). Against Megatron DDP running Muon on every rank, the same optimizer code, the difference is 8e-5.
@@ -239,36 +244,38 @@ Megatron layer-wise Muon vs FlexShard + DistMuon. The FlexShard side keeps `resh
      - These runs predate the cross-bucket owner balance, which moves matrices between ranks but leaves their updates unchanged.
    - Still to do: checkpoints, loss curves on the 1.4B model, and the benchmark.
 
-1. **Wire FlexShard + DistMuon in Megatron.**
-   - Pick Muon params with Megatron's `is_managed_by_layer_wise_optimizer` (qkv, proj, fc1 and fc2 weights), so both stacks use the same set.
-   - Add a `--flex-shard-dist-muon` mode: `assign_matrices` turns the Muon params into owned buckets per layer, and non-matrix params go on `Shard(0)` buckets.
-   - Optimizer: a `ChainedOptimizer` of DistMuon on fp32 main copies of the owned shards, plus Megatron Adam on the rest. Take the global grad norm over WORLD, and handle ranks that own no matrices.
-   - Relax the `--use-flex-shard` optimizer restriction.
-   - Since flex_shard #23, DistMuon's local adapter requires real-param grads in the param dtype. `--accumulate-allreduce-grads-in-fp32` gives bf16 params fp32 shard grads, so either let DistMuon accept fp32 grads or keep bf16 grads for Muon params.
-2. **Parity gate before timing.**
+1. **Padding.**
+   - Use Muon buckets that span several layers, so that each rank's share stays close to the mean, as in Megatron's buckets.
+   - FlexShard hooks each bucket on its parameters' deepest common module, which for several layers is the whole `TransformerBlock`. This needs a flex_shard option to hook a bucket on a list of modules.
+2. **Performance.** Same protocol as Phase A, step 3, also reporting each stack's Muon-minus-AdamW time and every rank's peak memory.
+3. **Checkpoints and loss curves:** Muon optimizer state in `torch_dist`, and loss curves on the 1.4B model over 500 iterations.
 
-   | Knob | Megatron | DistMuon |
-   | --- | --- | --- |
-   | Newton-Schulz coefficients / steps | `--muon-coefficient-type`, `--muon-num-ns-steps` | `ns_coefficients` (3.4445, −4.7750, 2.0315), `ns_steps=5` |
-   | Newton-Schulz precision | `--muon-fp32-matmul-prec` | bf16 |
-   | Update scale | `--muon-scale-mode spectral` | `adjust_lr_fn` (`original` √max(1, r/c), `match_rms_adamw`, `spectral_unclamped`) |
-   | Momentum / weight decay | `--muon-momentum`, `--muon-nesterov`, confirm decoupled weight decay | 0.95, Nesterov, decoupled |
-   | QKV / fc1 split | per-head split by default (`--muon-no-split-qkv`) | whole matrix or `BlockShard`; start with no split on both sides |
+#### Phase C: Megatron-FSDP vs FlexShard with reshard-after-forward
 
-   Checks:
-   - A single-matrix update agrees within ~2e-2.
-   - The Megatron and FlexShard Muon loss curves agree over 50 iterations at a stable lr.
-   - In Megatron, the Muon and AdamW curves differ, confirming Muon is active.
-3. **Performance.** Same protocol as Phase A, step 3, also reporting each stack's Muon-minus-AdamW time.
-4. **Risks.**
-   - Coarse ownership at DP = 8 (mitigate with block groups).
-   - DistMuon requires a grad for every configured param.
-   - Megatron's interleaved per-group QKV layout.
-   - Keep `overlap_param_gather_with_optimizer_step` off.
+Megatron-FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params`, ZeRO-3) vs FlexShard with reshard-after-forward (the `--use-flex-shard` default, ZeRO-3). Both trade communication for memory that the Phase A baseline doesn't save, so they are compared with each other, for models that don't fit with full params resident.
+
+- Earlier numbers, with the local spec and FlexShard before flex_shard #16, at 1 microbatch:
+  - 1.4B model: 179.9 ms for FlexShard vs 164.1 ms for Megatron-FSDP.
+  - 7.2B model: 649.6 vs 533.0 ms.
+  - Memory was similar, and iteration-1 loss and grad norm were bit-identical to the Phase A setups.
+
+1. **Re-measure** both with the current flex_shard, with Phase A's protocol (step 3).
+2. **Close gaps and record,** as in Phase A, step 4.
+
+#### Phase D: Megatron-FSDP v2 vs FlexShard
+
+Megatron-FSDP v2 has been experimental since June 2026 (`megatron_fsdp/experimental/`, Megatron-LM [#5387](https://github.com/NVIDIA/Megatron-LM/pull/5387)), and it is converging on FlexShard's design. Its DBuffer has:
+- per-parameter placements: `RowAtomic`, `BlockAtomic`, and `TensorAtomic`, which stores a whole tensor on one rank, like FlexShard's `BucketedOwned`;
+- a `GlobalLayout` with explicit rank segments, and uneven collectives ([#7670](https://github.com/NVIDIA/Megatron-LM/pull/7670), [#7671](https://github.com/NVIDIA/Megatron-LM/pull/7671));
+- an owner-based compute-planning API ([#6597](https://github.com/NVIDIA/Megatron-LM/pull/6597)).
+
+Compare it with FlexShard once it trains end to end in Megatron:
+- with AdamW, against Phase C's FlexShard setup;
+- with Muon against Phase B's, if its owner-based planning runs Muon.
 
 ## Roadmap
 
-After Phases A and B, in order of benchmarking value:
+Composition with the rest of Megatron, for the Megatron DDP vs FlexShard comparison of Phases A and B, in order of benchmarking value:
 1. **Tensor parallelism (Megatron vs FlexShard at TP × DP).** This is the most common Megatron configuration for dense models from about 8B up, so larger comparisons need it. `validate_args` no longer rejects it: FlexShard shards each TP rank's slices over that rank's data-parallel group (see [Design](#design)).
    - 117M model (4 layers, hidden 1024) at TP 2 × DP 2: iteration-1 loss and grad norm match Megatron exactly, with and without sequence parallelism, no-sync, `--qk-layernorm` and `--tp-comm-overlap`.
    - 1.4B model over 500 iterations at TP 2 × DP 2 and TP 2 × DP 4, with sequence parallelism: FlexShard's loss curves differ from Megatron's about as much as Megatron's two runs differ from each other.
@@ -276,7 +283,7 @@ After Phases A and B, in order of benchmarking value:
    - 7.2B model at TP 2 × DP 4 with sequence parallelism, measured with flex_shard at #21 and fusion off: FlexShard is 14% faster than Megatron at 1 microbatch (222 vs 259 ms/it, 16.8 vs 30.4 GB max allocated), 4.5% at 2 microbatches and 3% at 8 (with no-sync; 30.1 vs 30.4 GB). It doesn't need `CUDA_DEVICE_MAX_CONNECTIONS=1`: with it unset, step time stays within 2% (368 vs 366 ms/it at 2 microbatches, 1143 vs 1124 at 8).
 2. **Gradient accumulation fusion.** With TransformerEngine, Megatron by default has the weight-gradient GEMM accumulate straight into an fp32 `main_grad` buffer. `--use-flex-shard` now supports it (see [Design](#design)), and on the 117M model iteration-1 loss and grad norm match Megatron exactly with fusion on both sides.
    - With activation recompute (`--recompute-modules moe`, `--recompute-granularity full`), FlexShard used to fail in the recomputed backward with no `main_grad` on TransformerEngine's grouped-tensor GEMM path (`--moe-use-grouped-tensor`). Per-expert weights on the default GEMM path, and the dense model with full recompute, already matched Megatron. The fused layers now alias `main_grad` themselves (see [Design](#design)), and the grouped-tensor path matches Megatron with MoE recompute and fusion.
-   - Still to do: benchmark Megatron and FlexShard with fusion on the 1.4B and 7.2B models. The benchmarks so far turned fusion off on both sides, partly because this environment lacks APEX's `fused_weight_gradient_mlp_cuda`, which Megatron's own linear layers need for fusion.
+   - Still to do: benchmark Megatron and FlexShard with fusion on the 1.4B and 7.2B models. The benchmarks so far turned fusion off on both sides, partly because this environment lacked APEX's `fused_weight_gradient_mlp_cuda`, which Megatron's own linear layers need for fusion; it is now built for the benchmarks.
 3. **Tied embeddings.** `--use-flex-shard` now supports Megatron's default tied embedding and output weights (see [Design](#design)). On the 117M model, iteration-1 loss and grad norm match Megatron exactly at DP 4 and at TP 2 × DP 2 with sequence parallelism, with no-sync, fusion and multi-token prediction. The 1.4B model tracks Megatron over 500 iterations within its run-to-run spread.
 4. **Expert parallelism (MoE, Megatron vs FlexShard).** `--use-flex-shard` now supports EP (see [Design](#design)), with flex_shard [#27](https://github.com/meta-pytorch/flex_shard/pull/27).
    - Small MoE model (4 layers, hidden 1024, 8 experts, top-2, expert FFN 2048, grouped GEMM, all-to-all dispatcher, tied embeddings) on 8 GPUs: iteration-1 loss and grad norm match Megatron DDP + distributed optimizer exactly at EP 1, 2, 4 and 8, and at TP 2 with sequence parallelism, expert TP 2 and 1, and EP 2 and 4. At EP 4 they also match with reshard-after-forward, no-sync, per-token loss, expert bias, shared experts with and without overlap, a dense first layer, multi-token prediction, recompute of `moe_act` and of `moe`, the allgather dispatcher, gradient accumulation fusion, experts without grouped GEMM, and with 64 experts, top-1 routing and 32-token sequences, where many experts receive no tokens.
@@ -316,4 +323,3 @@ After Phases A and B, in order of benchmarking value:
      - The small MoE model at EP 4 also resumes and cross-loads, with grouped-tensor experts (item 4) and with single grouped weights (item 8).
      - Still to do (`FLEXSHARD_CHECKPOINT_PLAN.md`): loading at a different DP size, TP and PP, and a mid-run resume on the 1.4B model.
    - **Evaluation** (`--eval-iters > 0`) is untested, since every benchmark ran with evaluation off.
-10. **ZeRO-3: FlexShard with reshard-after-forward vs Megatron-FSDP,** only for models that don't fit with full params resident. The numbers above for those two setups predate flex_shard #16.
