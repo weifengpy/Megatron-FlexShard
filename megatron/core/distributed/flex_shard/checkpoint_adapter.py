@@ -27,12 +27,13 @@ The checkpoint thus has Megatron DDP's keys and global shapes, and the two load 
 """
 
 import dataclasses
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from flex_shard import get_flex_shard_global_layouts
 
-from ...dist_checkpointing.dict_utils import dict_list_map_inplace, nested_values
+from ...dist_checkpointing.dict_utils import nested_values
 from ...dist_checkpointing.mapping import (
     ReplicaId,
     ShardedStateDict,
@@ -134,22 +135,32 @@ class _ChunkPlan:
         return out
 
 
-def _local_shard_factory(
-    entry: Any, stand_in: torch.Tensor, local: torch.nn.Parameter, layout: Any
-) -> ShardedTensorFactory:
-    """A factory over ``local`` that emits ``entry``'s pieces cut down to the local chunks."""
+def _entry_pieces(entry: Any, key: str, replica_id: ReplicaId) -> List[ShardedTensor]:
+    """Megatron's pieces for one entry, built on the stand-in or the view of it the entry holds."""
     if isinstance(entry, ShardedTensorFactory):
-        # E.g. SwiGLU's gate/up split: Megatron's own build on the stand-in gives the pieces.
-        def megatron_pieces(key, replica_id):
-            built = entry.build_fn(key, stand_in, replica_id, None)
-            return list(nested_values(built))
+        # E.g. SwiGLU's gate/up split: Megatron's own build gives the pieces.
+        return list(nested_values(entry.build_fn(key, entry.data, replica_id, None)))
+    return [dataclasses.replace(entry, key=key, replica_id=replica_id)]
 
-    else:
 
-        def megatron_pieces(key, replica_id):
-            return [dataclasses.replace(entry, key=key, replica_id=replica_id)]
+def _local_shard_factory(
+    entries: List[Any], stand_in: torch.Tensor, local: torch.nn.Parameter, layout: Any
+) -> ShardedTensorFactory:
+    """A factory over ``local`` that emits ``entries``' pieces cut down to the local chunks.
 
-    pieces = megatron_pieces(entry.key, entry.replica_id)
+    Usually one entry over the whole stand-in. A single grouped MoE weight gives one entry per
+    expert, each over the expert's rows of the stand-in, which Megatron splits off with
+    ``torch.chunk`` (``TEGroupedLinear._split_grouped_checkpoint_tensor``).
+    """
+    first = entries[0]
+    assert all(e.key == first.key and e.replica_id == first.replica_id for e in entries), (
+        f"Entries of one parameter differ in key or replica id: {[e.key for e in entries]}"
+    )
+
+    def megatron_pieces(key, replica_id):
+        return [piece for e in entries for piece in _entry_pieces(e, key, replica_id)]
+
+    pieces = megatron_pieces(first.key, first.replica_id)
     regions = [_region_in(piece.data, stand_in) for piece in pieces]
     plan = _ChunkPlan(regions, layout, local.shape)
     last_built = {}
@@ -163,8 +174,43 @@ def _local_shard_factory(
         return plan.merge(loaded, last_built.get("tensor"))
 
     return ShardedTensorFactory(
-        key=entry.key, data=local, build_fn=build_fn, merge_fn=merge_fn, replica_id=entry.replica_id
+        key=first.key, data=local, build_fn=build_fn, merge_fn=merge_fn, replica_id=first.replica_id
     )
+
+
+def _replace_stand_in_entries(sharded_state_dict: Dict, by_storage: Dict) -> None:
+    """Replace, in place and in nested dicts, the entries built from stand-ins with factories.
+
+    Entries of one single grouped weight (``linear_fc1.weight0``, ``weight1``, ...) become one
+    factory under the module's own key (``linear_fc1.weight``), which ``load_state_dict`` loads
+    into the plain parameter FlexShard shards.
+    """
+    groups: Dict[Tuple[int, str], List[Tuple[str, Any]]] = {}
+    for dict_key, entry in list(sharded_state_dict.items()):
+        if isinstance(entry, dict):
+            _replace_stand_in_entries(entry, by_storage)
+            continue
+        if not isinstance(entry, (ShardedTensor, ShardedTensorFactory)) or entry.data is None:
+            continue
+        found = by_storage.get(entry.data.untyped_storage()._cdata)
+        if found is None:
+            assert not entry.data.is_meta, (
+                f"{entry.key} holds a stand-in that the adapter can't map back to its local shard"
+            )
+            continue
+        stand_in = found[0]
+        if entry.data is stand_in:
+            sharded_state_dict[dict_key] = _local_shard_factory([entry], *found)
+        else:
+            param_key = re.sub(r"(weight|bias)\d+$", r"\1", dict_key)
+            groups.setdefault((id(stand_in), param_key), []).append((dict_key, entry))
+    for (stand_in_id, param_key), keyed_entries in groups.items():
+        for dict_key, _ in keyed_entries:
+            del sharded_state_dict[dict_key]
+        found = next(f for f in by_storage.values() if id(f[0]) == stand_in_id)
+        sharded_state_dict[param_key] = _local_shard_factory(
+            [entry for _, entry in keyed_entries], *found
+        )
 
 
 def flex_shard_sharded_state_dict(
@@ -202,15 +248,9 @@ def flex_shard_sharded_state_dict(
     for owner, name, local in slots:
         owner._parameters[name] = local
 
-    def convert(entry):
-        if isinstance(entry, (ShardedTensor, ShardedTensorFactory)):
-            found = by_stand_in.get(id(entry.data))
-            if found is not None:
-                return _local_shard_factory(entry, *found)
-            assert entry.data is None or not entry.data.is_meta, (
-                f"{entry.key} holds a stand-in that the adapter can't map back to its local shard"
-            )
-        return entry
-
-    dict_list_map_inplace(convert, sharded_state_dict)
+    by_storage = {
+        stand_in.untyped_storage()._cdata: (stand_in, local, layout)
+        for stand_in, local, layout in by_stand_in.values()
+    }
+    _replace_stand_in_entries(sharded_state_dict, by_storage)
     return sharded_state_dict

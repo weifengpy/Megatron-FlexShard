@@ -1150,10 +1150,10 @@ def validate_args(args, defaults={}):
             # Its FP8 placement doesn't describe where its block rows sit yet.
             assert not args.flex_shard_fp8_param_gather, \
                 '--use-flex-shard does not save or load with --fp8-param-gather yet'
-            # Megatron's grouped checkpoint layout expects the GroupedTensor, not FlexShard's plain
-            # (experts * out, in) parameter (te_grouped.py).
-            assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
-                '--use-flex-shard does not save or load single grouped MoE weights yet'
+            # Megatron splits a single grouped bias into per-expert rows with unbind, views the
+            # checkpoint adapter doesn't map back yet (single grouped weights use torch.chunk).
+            assert not args.moe_single_grouped_bias, \
+                '--use-flex-shard does not save or load single grouped MoE biases yet'
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
