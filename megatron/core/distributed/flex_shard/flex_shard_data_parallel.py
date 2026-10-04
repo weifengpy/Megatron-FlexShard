@@ -58,7 +58,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     with such layers, FlexShard's pre-backward hook allocates each gathered parameter's
     gradient and aliases it as ``main_grad``, and its post-reduce hook drops the alias once
     the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
-    gradient FlexShard reduce-scatters, across microbatches with no_sync.
+    gradient FlexShard reduce-scatters, across microbatches with no_sync. Activation recompute
+    runs a layer's forward again inside backward, after an original forward without gradients
+    that left FlexShard no pre-backward hook for its bucket, so each fused layer also aliases
+    its gathered parameters' gradients in a forward pre-hook when its forward runs inside
+    backward.
 
     With tied embeddings, the model fetches the output weight before it calls the output layer
     and passes it in at call time, so FlexShard cannot see that use from parameter names. On the
@@ -280,6 +284,15 @@ class FlexShardDataParallel(_BaseDataParallel):
                 setattr(param, attr_name, attr_value)
             param.is_flex_shard_param = True
 
+        fused_owners: Dict[torch.nn.Module, List[str]] = {}
+        for fqn in fused_fqns:
+            owner_path, _, param_name = fqn.rpartition(".")
+            fused_owners.setdefault(self.module.get_submodule(owner_path), []).append(param_name)
+        for owner, param_names in fused_owners.items():
+            owner.register_forward_pre_hook(
+                functools.partial(self._alias_main_grads_in_recompute, param_names)
+            )
+
         log_single_rank(
             logger,
             logging.INFO,
@@ -360,6 +373,21 @@ class FlexShardDataParallel(_BaseDataParallel):
                 dtype = torch.float32 if self.ddp_config.grad_reduce_in_fp32 else param.dtype
                 param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
             param.main_grad = param.grad
+
+    def _alias_main_grads_in_recompute(
+        self, param_names: List[str], module: torch.nn.Module, args: Tuple
+    ) -> None:
+        """Forward pre-hook of a layer with fused weight gradients, for activation recompute.
+
+        Recompute runs the layer's forward again inside backward, after an original forward
+        without gradients, which registered none of FlexShard's pre-backward hooks, so nothing
+        has aliased ``main_grad`` before the recomputed backward adds into it. A forward with
+        gradients inside backward is such a recompute (the test flex_shard's ``_in_backward``
+        uses). FlexShard's own pre-forward hook, on this module or an ancestor, has already
+        swapped in the gathered parameters.
+        """
+        if torch.is_grad_enabled() and torch._C._current_graph_task_id() != -1:
+            self._alias_main_grads([(name, module._parameters[name]) for name in param_names])
 
     def unshard(self) -> None:
         """Gather every bucket for a schedule that calls the layers' sub-modules directly (the
