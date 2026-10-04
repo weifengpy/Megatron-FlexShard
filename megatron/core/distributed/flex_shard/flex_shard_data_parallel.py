@@ -6,17 +6,11 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
+from flex_shard.custom_placements import MixedBucketPlacement
+from flex_shard.custom_placements.shard import per_param_placements
 from torch.distributed import ProcessGroup
-
-try:
-    from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
-    from flex_shard.custom_placements import MixedBucketPlacement
-    from flex_shard.custom_placements.shard import per_param_placements
-    from torch.distributed.device_mesh import DeviceMesh
-
-    HAVE_FLEX_SHARD = True
-except ImportError:
-    HAVE_FLEX_SHARD = False
+from torch.distributed.device_mesh import DeviceMesh
 
 from ... import parallel_state
 from ...models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -134,8 +128,6 @@ class FlexShardDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         process_group: Optional[ProcessGroup] = None,
     ):
-        assert HAVE_FLEX_SHARD, 'FlexShardDataParallel requires the flex_shard package.'
-
         super().__init__(config=config, module=module)
         self.ddp_config = ddp_config
 

@@ -30,6 +30,7 @@ import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from flex_shard import get_flex_shard_global_layouts
 
 from ...dist_checkpointing.dict_utils import dict_list_map_inplace, nested_values
 from ...dist_checkpointing.mapping import (
@@ -38,13 +39,6 @@ from ...dist_checkpointing.mapping import (
     ShardedTensor,
     ShardedTensorFactory,
 )
-
-try:
-    from flex_shard import get_flex_shard_global_layouts
-
-    HAVE_FLEX_SHARD = True
-except ImportError:
-    HAVE_FLEX_SHARD = False
 
 Region = Tuple[Tuple[int, ...], Tuple[int, ...]]  # (offsets, sizes) in the full parameter
 
@@ -200,11 +194,9 @@ def flex_shard_sharded_state_dict(
             by_stand_in[id(stand_in)] = (stand_in, local, layout)
         slots.append((owner, name, local))
         owner._parameters[name] = stand_in
-    try:
-        sharded_state_dict = module.sharded_state_dict(prefix, sharded_offsets, metadata)
-    finally:
-        for owner, name, local in slots:
-            owner._parameters[name] = local
+    sharded_state_dict = module.sharded_state_dict(prefix, sharded_offsets, metadata)
+    for owner, name, local in slots:
+        owner._parameters[name] = local
 
     def convert(entry):
         if isinstance(entry, (ShardedTensor, ShardedTensorFactory)):
