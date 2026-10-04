@@ -614,6 +614,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if grad.numel() == 0:
+            # FlexShard stores each Muon matrix whole on one rank; the others hold an empty
+            # (0, n) shard of it, and so do their TP peers, so no collective is skipped.
+            return grad
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (

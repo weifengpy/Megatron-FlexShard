@@ -7,7 +7,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
-from flex_shard.custom_placements import MixedBucketPlacement
+from flex_shard.custom_placements import (
+    MixedBucketPlacement,
+    make_bucketed_owned_full_param_placement_fn,
+)
 from flex_shard.custom_placements.shard import per_param_placements
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
@@ -106,6 +109,13 @@ class FlexShardDataParallel(_BaseDataParallel):
     all-gather in 128 x 128 blockwise FP8, quantized by TransformerEngine's own weight quantizer,
     and their layers receive the gathered ``Float8BlockwiseQTensor``; the rest of each bucket
     shares that collective (te_fp8.py).
+
+    With Muon (``ddp_config.own_matrices``), each bucket holding a Muon matrix stores every
+    parameter whole on one rank (flex_shard's BucketedOwned, owners balanced by size within the
+    bucket). The reduce-scatter delivers each matrix's whole gradient to its owner, where
+    Megatron's Muon orthogonalizes it with no optimizer communication; other ranks hold empty
+    (0, n) shards of it, which the optimizer steps as no-ops. The next forward's all-gather
+    carries the updated matrices, so there is no all-gather after the step.
 
     With TransformerEngine's single grouped MoE weights (--moe-single-grouped-weight), each
     grouped linear's ``GroupedTensor`` weight, which bans slicing, becomes a plain
@@ -227,6 +237,14 @@ class FlexShardDataParallel(_BaseDataParallel):
                 if te_fp8.is_blockwise_fp8_weight(submodule, param_name, param)
             }
         has_fp8 = [any(fqn in fp8_fqns for fqn in fqns) for fqns in bucket_fqns]
+        # With Muon, buckets holding its matrices store each parameter whole on one rank.
+        owned = [
+            ddp_config.own_matrices and any(_is_muon_matrix(params[fqn]) for fqn in fqns)
+            for fqns in bucket_fqns
+        ]
+        assert not any(o and f for o, f in zip(owned, has_fp8)), (
+            "FlexShard's whole-matrix buckets for Muon don't all-gather FP8 weights"
+        )
         # With the EP overlap schedule, a TransformerLayer's buckets (its dense parameters and its
         # experts) finish from the schedule's per-layer post-backward hook (finish_layer_backward),
         # after the layer's last backward step or its backward_dw(), so the reduce-scatters in
@@ -254,7 +272,13 @@ class FlexShardDataParallel(_BaseDataParallel):
             BucketSpec(
                 fqns,
                 placement_fn=(
-                    self._fp8_placement_fn(fp8_fqns) if has_fp8[i] else per_param_placements
+                    self._fp8_placement_fn(fp8_fqns)
+                    if has_fp8[i]
+                    else (
+                        make_bucketed_owned_full_param_placement_fn()
+                        if owned[i]
+                        else per_param_placements
+                    )
                 ),
                 mesh=self.expert_device_mesh if is_expert[i] else self.device_mesh,
                 mp_policy=mp_policy,
@@ -313,6 +337,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"main_grad buckets={sum(uses_main_grad)}, "
             f"deferred buckets={sum(deferred)}, "
             f"fp8 weights={len(fp8_fqns)}, "
+            f"owned buckets={sum(owned)}, "
             f"single grouped params={num_grouped}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
@@ -547,6 +572,16 @@ class FlexShardDataParallel(_BaseDataParallel):
 def _is_expert_param(param: torch.nn.Parameter) -> bool:
     """Whether ``param`` uses the expert topology (EP/ETP/expert data parallelism)."""
     return not getattr(param, "allreduce", True)
+
+
+def _is_muon_matrix(param: torch.nn.Parameter) -> bool:
+    """Whether Megatron's Muon updates ``param`` (megatron/core/optimizer/emerging_optimizers.py
+    ``_is_muon_excluded``): 2-D, neither embedding nor output, and not opted out."""
+    return (
+        param.dim() == 2
+        and getattr(param, "use_muon", True)
+        and not getattr(param, "is_embedding_or_output_parameter", False)
+    )
 
 
 def _common_module_path(fqns: List[str]) -> str:
