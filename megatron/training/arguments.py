@@ -1115,8 +1115,8 @@ def validate_args(args, defaults={}):
         assert not args.overlap_param_gather, \
             '--use-flex-shard is not supported with --overlap-param-gather'
         assert not args.fp16, '--use-flex-shard not supported with fp16 yet'
-        assert args.optimizer in ('adam', 'sgd'), \
-            '--use-flex-shard supports only --optimizer adam or sgd'
+        assert args.optimizer in ('adam', 'sgd', 'muon'), \
+            '--use-flex-shard supports only --optimizer adam, sgd or muon'
         assert args.flex_shard_no_sync or args.flex_shard_reshard_after_backward, \
             '--flex-shard-no-reshard-after-backward requires --flex-shard-no-sync'
 
@@ -1142,6 +1142,15 @@ def validate_args(args, defaults={}):
                 'all-gather bf16 parameters instead, turning off fp4_param_gather',
                 args.rank,
             )
+        if args.optimizer == 'muon':
+            # Muon's buckets store whole matrices on their owners (BucketedOwned), which
+            # FlexShard's FP8 placement doesn't.
+            assert not args.flex_shard_fp8_param_gather, \
+                '--use-flex-shard with --optimizer muon does not support --fp8-param-gather'
+            # Megatron's Muon has no update rule for a stacked [E, N, K] expert weight.
+            assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
+                '--use-flex-shard with --optimizer muon does not support single grouped MoE ' \
+                'weights or biases'
         # Checkpoints cut Megatron's torch_dist pieces down to FlexShard's local chunks
         # (megatron/core/distributed/flex_shard/checkpoint_adapter.py).
         if args.save or args.load:

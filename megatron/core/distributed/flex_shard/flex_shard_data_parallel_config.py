@@ -27,3 +27,10 @@ class FlexShardDataParallelConfig(DistributedDataParallelConfig):
     and without reshard_after_forward, one all-gather and one reduce-scatter per bucket per
     step. The last microbatch's backward always reshards.
     """
+
+    own_matrices: bool = False
+    """Store each bucket that holds a Muon matrix with whole-parameter owners (flex_shard's
+    BucketedOwned): each parameter lives on one rank, which receives its whole gradient, so
+    Muon orthogonalizes complete matrices locally, without optimizer communication. The
+    embedding and output buckets keep row shards.
+    """
