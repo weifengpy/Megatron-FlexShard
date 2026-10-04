@@ -103,7 +103,10 @@ class _ChunkPlan:
             piece = pieces[index]
             prepend = piece.prepend_axis_num
             r_start = self.regions[index][0]
-            data = tensor[self._slices(local_start, size)]
+            # Megatron writes uneven pieces through CheckpointableShardedTensor, whose DCP chunk
+            # pairs the global offset with the local shape, so the prepended axes (e.g. the
+            # layer index) become leading size-1 dims of the piece itself.
+            data = tensor[self._slices(local_start, size)][(None,) * prepend]
             global_offset = piece.global_offset[:prepend] + tuple(
                 g + s - r for g, s, r in zip(piece.global_offset[prepend:], start, r_start)
             )
@@ -112,10 +115,11 @@ class _ChunkPlan:
                     piece,
                     data=data,
                     dtype=data.dtype,
-                    local_shape=size,
+                    local_shape=(1,) * prepend + size,
                     global_offset=global_offset,
                     axis_fragmentations=None,
                     replica_id=_owned(piece.replica_id),
+                    prepend_axis_num=0,
                 )
             )
         return out
@@ -126,7 +130,7 @@ class _ChunkPlan:
         ref = loaded[0] if loaded else like
         out = torch.zeros(self.local_shape, dtype=ref.dtype, device=ref.device)
         for (_, _, size, local_start), chunk in zip(self.chunks, loaded):
-            out[self._slices(local_start, size)].copy_(chunk)
+            out[self._slices(local_start, size)].copy_(chunk.reshape(size))
         return out
 
 
