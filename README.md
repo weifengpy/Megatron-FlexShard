@@ -286,7 +286,10 @@ After Phases A and B, in order of benchmarking value:
    - Still to do: CP 2 × TP 2 × DP 2 and CP 2 × PP 2 × DP 2; CP 4 and 8; the all-gather, all-to-all and hierarchical CP communication types; MTP, recompute, fusion, per-token loss and untied embeddings; the small MoE model with EP; loss curves on the 1.4B model; and a long-context benchmark.
 7. **FP8 parameter all-gather.** `--use-flex-shard` all-gathers TransformerEngine's weights in FP8 with `--fp8-param-gather --fp8-recipe blockwise` (see [Design](#design)); with other recipes it still switches the flag off with a warning.
    - 117M model with the blockwise recipe at DP 8: iteration-1 loss and grad norm match Megatron DDP + distributed optimizer's blockwise FP8 training without `--fp8-param-gather` exactly, and peak allocated memory drops by 94 MB (1224 vs 1317 MB) against FlexShard's bf16 all-gather.
-   - Still to do: the composition matrix (TP, EP, PP, the EP overlap, fusion, recompute), loss curves against Megatron with `--fp8-param-gather`, and a benchmark.
+   - Composition matrix, against the same Megatron baseline: the iteration-1 loss and grad norm and the iteration-2 loss match exactly on the 117M model with TP 2, PP 2, per-token loss, full recompute and gradient accumulation fusion, and on the small MoE model with EP 2 (with and without the EP overlap) and with grouped-tensor experts at EP 4.
+     - Later iterations differ by at most 5.4e-4 on the 117M model, against 4.9e-4 at plain DP 8.
+     - On the MoE model they differ by 1.8e-3 to 3.2e-3; two Megatron runs differ by 1.2e-3 to 1.3e-3 there.
+   - Still to do: loss curves against Megatron with `--fp8-param-gather`, and a benchmark.
 8. **Single grouped MoE weights.** `--use-flex-shard` supports `--moe-single-grouped-weight` and `--moe-single-grouped-bias` for bf16 weights (see [Design](#design)).
    - These runs used a TransformerEngine 2.21.0.dev0 rebuilt against cuBLAS 13.8, preloaded at run time, since this node's CUDA 13.0 and 13.1 ship cuBLAS 13.1 and 13.2.
    - A standalone check on one `GroupedLinear`: forward output, input gradient, and weight and bias gradients are bit-identical to TransformerEngine's own single grouped parameters, with and without fusion, with delayed weight gradients, with two microbatches interleaved, and after the gathered storage is freed and refilled.
