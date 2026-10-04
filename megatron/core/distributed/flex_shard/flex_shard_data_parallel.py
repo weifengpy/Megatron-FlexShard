@@ -6,17 +6,11 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
+from flex_shard.custom_placements import MixedBucketPlacement
+from flex_shard.custom_placements.shard import per_param_placements
 from torch.distributed import ProcessGroup
-
-try:
-    from flex_shard import BucketSpec, MixedPrecisionPolicy, flex_shard
-    from flex_shard.custom_placements import MixedBucketPlacement
-    from flex_shard.custom_placements.shard import per_param_placements
-    from torch.distributed.device_mesh import DeviceMesh
-
-    HAVE_FLEX_SHARD = True
-except ImportError:
-    HAVE_FLEX_SHARD = False
+from torch.distributed.device_mesh import DeviceMesh
 
 from ... import parallel_state
 from ...models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -26,7 +20,7 @@ from ...transformer.transformer_config import TransformerConfig
 from ...transformer.transformer_layer import TransformerLayer
 from ...utils import log_single_rank
 from ..data_parallel_base import _BaseDataParallel
-from . import te_fp8, te_grouped
+from . import checkpoint_adapter, te_fp8, te_grouped
 from .flex_shard_data_parallel_config import FlexShardDataParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -115,6 +109,11 @@ class FlexShardDataParallel(_BaseDataParallel):
     wraps FlexShard's gathered tensor back into a ``GroupedTensor`` every forward, with no copy
     (te_grouped.py).
 
+    Checkpoints (``--ckpt-format torch_dist``) have Megatron DDP's keys and global shapes: the
+    module's own ``sharded_state_dict()`` runs on meta stand-ins of the full parameters, and each
+    entry is cut down to the chunks of the local shard that flex_shard's layouts describe
+    (checkpoint_adapter.py).
+
     Args:
         config: Transformer config object.
         ddp_config: FlexShardDataParallelConfig object.
@@ -135,8 +134,6 @@ class FlexShardDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         process_group: Optional[ProcessGroup] = None,
     ):
-        assert HAVE_FLEX_SHARD, 'FlexShardDataParallel requires the flex_shard package.'
-
         super().__init__(config=config, module=module)
         self.ddp_config = ddp_config
         # Before anything reads the parameters: FlexShard shards plain tensors.
@@ -468,6 +465,14 @@ class FlexShardDataParallel(_BaseDataParallel):
                 groups.setdefault(key, []).append(fqn)
             split_buckets.extend(groups.values())
         return split_buckets
+
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple = (), metadata=None):
+        """The wrapped module's sharded state dict, of FlexShard's local shards, with Megatron
+        DDP's keys and global shapes (checkpoint_adapter.py). MegatronModule's default would
+        prefix every key with 'module.'."""
+        return checkpoint_adapter.flex_shard_sharded_state_dict(
+            self.module, prefix, sharded_offsets, metadata
+        )
 
     @contextmanager
     def no_sync(self):

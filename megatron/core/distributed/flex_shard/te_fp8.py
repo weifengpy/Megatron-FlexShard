@@ -20,22 +20,22 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+from flex_shard.custom_placements.fp8_bucketed_block_shard import (
+    _VEC_ALIGN_BYTES,
+    _VEC_COPY_DTYPE,
+    _VEC_COPY_NBYTES,
+    Fp8BucketedBlockShard,
+    _align_up,
+    _cat_byte_regions_from_flat_storage,
+    _cat_byte_regions_from_rank_rows,
+    _ceil_div,
+    _is_vec_copy_viewable,
+)
+from flex_shard.flex_shard.placement_contract import PlacementUnshardResult
+from flex_shard.flex_shard.utils import _record_copy_out_if_eager
 
 try:
     import transformer_engine_torch as tex
-    from flex_shard.custom_placements.fp8_bucketed_block_shard import (
-        _VEC_ALIGN_BYTES,
-        _VEC_COPY_DTYPE,
-        _VEC_COPY_NBYTES,
-        Fp8BucketedBlockShard,
-        _align_up,
-        _cat_byte_regions_from_flat_storage,
-        _cat_byte_regions_from_rank_rows,
-        _ceil_div,
-        _is_vec_copy_viewable,
-    )
-    from flex_shard.flex_shard.placement_contract import PlacementUnshardResult
-    from flex_shard.flex_shard.utils import _record_copy_out_if_eager
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
     from transformer_engine.pytorch.quantization import get_fp8_te_dtype
     from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
@@ -46,8 +46,6 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
-    # Lets the module import without TransformerEngine; the placement is used only with it.
-    Fp8BucketedBlockShard = object
 
 BLOCK_SIZE = 128
 
