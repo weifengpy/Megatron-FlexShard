@@ -170,15 +170,46 @@ Setup:
 
 **CPU-bound contrast: micro-batch size 1, seq 2048**
 
-| Microbatches | Megatron, ms/it | FlexShard, ms/it | Change | Max allocated per rank, Megatron / FlexShard |
-| --- | --- | --- | --- | --- |
-| 1 (GBS 8) | 116.3 | 130.5 | +12.2% | 13.4 / 8.5 GB |
-| 4 (GBS 32) | 352.2 | 369.5 | +4.9% | 13.4 / 13.6 GB |
+Two sessions on different days, one run per cell each:
 
-- **The forward is bound by kernel launches in both stacks.** With 2048 tokens per micro-batch, a layer's forward is about 0.8 ms of GPU work but 2.3 ms (Megatron) and 2.8 ms (FlexShard) of CPU work to launch. These come from profiled steps, and the profiler's shape recording adds some CPU time.
-- **Each forward all-gather waits for the slowest rank.** Once every rank has launched it, it takes 0.25 ms. But ranks start it a median of 2.1 ms (Megatron) and 2.6 ms (FlexShard) apart, and the same rank arrives last for every all-gather in a run.
-- **FlexShard's per-bucket hooks add about 0.5 ms of CPU per layer,** which is most of the gap at 1 microbatch. Most of it is copying each gathered bucket into the persistent unsharded params: `Shard(0)` gathers rank-major, while Megatron's params are views into its flat buffer.
-- **At 4 microbatches, the gap is mostly the last backward's reduce-scatters.** FlexShard's run at about 78 GB/s against Megatron's 203, and end with a 36.5 ms drain against 12 ms.
+| Microbatches | Session | Megatron, ms/it | FlexShard, ms/it | Change |
+| --- | --- | --- | --- | --- |
+| 1 (GBS 8) | first | 116.3 | 130.5 | +12.2% |
+| 1 (GBS 8) | second | 128.7 | 122.8 | −4.6% |
+| 4 (GBS 32) | first | 352.2 | 369.5 | +4.9% |
+| 4 (GBS 32) | second | 362.9 | 379.7 | +4.6% |
+
+Max allocated per rank is 13.4 GB for Megatron in every cell. For FlexShard it is 8.5 GB at 1 microbatch and 13.6 GB at 4, where no-sync keeps full gradients.
+
+- **At 1 microbatch, single runs don't settle the comparison.** FlexShard was 12% slower in one session and 5% faster in the next.
+  - The forward is bound by kernel launches in both stacks. With 2048 tokens per micro-batch, a layer's forward is about 0.8 ms of GPU work but 2.3–2.8 ms of CPU work to launch.
+  - Each forward all-gather then waits for the slowest rank. Once every rank has launched it, it takes 0.25 ms, but ranks start it a median of 2.1–2.6 ms apart.
+  - In each run, the same rank arrives last for every all-gather, and it is a different rank in each run. So the step runs at the pace of whichever rank's CPU lags in that run.
+  - These figures come from profiled steps; the profiler's shape recording adds some CPU time.
+- **At 4 microbatches, FlexShard was about 5% slower in both sessions.** In the first session's profile, the gap was the last backward's reduce-scatters: FlexShard's ran at about 78 GB/s against Megatron's 203, and the step ended with a 36.5 ms drain against 12 ms.
+
+CPU time per train step on rank 0, at 1 microbatch, over steps 7–15. These were measured with timing wrappers instead of the profiler, before flex_shard [#37](https://github.com/meta-pytorch/flex_shard/pull/37):
+
+| | Megatron | FlexShard |
+| --- | --- | --- |
+| Train step, wall | 120.6 ms | 119.4 ms |
+| Forward, main-thread CPU | 57.0 ms | 58.6 ms |
+| … of which data-parallel hooks | 5.4 ms (forward pre-hooks on 345 modules) | 13.5 ms (27 bucket pre-forward hooks) |
+| Backward data-parallel hooks, on the autograd thread | 23.0 ms (147 per-param hooks, 21.5 ms of it launching 26 reduce-scatters) | 15.0 ms (27 post-backward hooks) |
+
+- **The model dominates the forward's CPU time:** about 45–50 ms per step, roughly 2 ms per layer of Megatron's and TransformerEngine's Python, the same in both stacks.
+- **FlexShard's forward hooks cost about 8 ms per step more than Megatron's,** 0.5 vs 0.2 ms per layer. Per bucket:
+  - Finishing the unshard takes about 0.2 ms. About half is the copy-out, mostly launching the `split_with_sizes_copy` that `Shard(0)`'s rank-major layout needs. The rest is version-counter and storage bookkeeping. Megatron needs no copy-out, since its params are views into the buffer it all-gathers into.
+  - Starting the next bucket's all-gather takes about 0.2 ms: copying the local shards into a send buffer, then launching the collective with its stream, event and profiler-annotation setup.
+  - The input-gradient trigger, swapping the parameters in and the post-forward hook take the remaining 0.1 ms.
+- **In backward, FlexShard's hooks cost less than Megatron's,** and they run on the autograd thread while the GPU is busy.
+- **flex_shard #37 trims the copy-out.** It skips rebuilding full-param views when refilling persistent buffers, as FSDP2 builds its unsharded parameters only once.
+  - Averaged over three alternating runs of each, FlexShard's pre-forward hooks drop from 14.2 to 12.8 ms of CPU per step, and the copy-out from 2.9 to 2.0 ms. The ranges across runs don't overlap.
+  - Step times moved the same way, but by more than the CPU saved and within their run-to-run spread, so they aren't attributed to #37.
+- **A flat-buffer layout doesn't help here.** An experiment replaced `Shard(0)` with flex_shard's `BucketedBlockShard`, which lays each bucket out like Megatron's flat buffer: param-major, with contiguous per-rank ranges. It ran at 138.8 and 394.3 ms/it in the second session, with matching iteration-1 loss.
+  - Its forward CPU per layer is the same as `Shard(0)`'s, 2.80 vs 2.75 ms. It drops the per-parameter copy-out, but its own send-buffer setup and bucket copy cost about as much. Most of the per-layer cost is FlexShard's bucket bookkeeping, not the copy.
+  - Its reduce path costs more, 5.9 vs 3.6 ms of copy-in CPU per step, because it zero-fills and copies the whole bucket twice.
+  - Its slower step times also include stragglers: at 4 microbatches, its forward all-gathers each waited about 2.5 ms, while `Shard(0)`'s in the same session ran at full speed, 288 GB/s.
 
 **Correctness gate** (200 iterations at micro-batch size 1, 4 microbatches, lr 1e-4 with 20 warmup iterations):
 - FlexShard's largest loss difference from Megatron, 7.7e-3, is smaller than the largest difference between two Megatron runs, 8.6e-3.
@@ -262,7 +293,12 @@ Megatron DDP + distributed optimizer vs FlexShard without reshard-after-forward,
    - Record the final numbers here.
 - Status: steps 2 and 3 ran on the 1.4B model, with one run per cell and a 200-iteration gate (see [Phase A results](#phase-a-results-transformerengine-14b-model-dp-8)).
    - When GPU-bound, FlexShard matches Megatron within 1%.
-   - Still to do: the 7.2B model, repetitions, and step 4's fixes for FlexShard's lower collective bandwidth and its per-bucket CPU work.
+   - When CPU-bound, at 1 microbatch, single runs vary between sessions by more than the gap, because stragglers change from run to run. At 4 microbatches, FlexShard was about 5% slower in both sessions.
+   - flex_shard #37 trims FlexShard's per-bucket CPU work by about 1.0–1.4 ms per step.
+   - Still to do:
+     - the 7.2B model;
+     - repetitions for the CPU-bound case, with each rank pinned to its GPU's NUMA node and cores to tame the stragglers;
+     - step 4's fixes for FlexShard's lower collective bandwidth and the rest of its per-bucket CPU work.
 
 #### Phase B: Muon, Megatron DDP vs FlexShard
 
