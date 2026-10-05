@@ -22,6 +22,12 @@ DCP's ``CheckpointableTensor`` layout: per chunk, a global offset, a local offse
 - The build slices whatever tensor it is given, so Megatron's optimizer, which replaces a
   factory's data with each optimizer state of the parameter (``make_sharded_optimizer_tensor``),
   reuses it for the fp32 main parameters and Adam moments, which have the shard's shape.
+- A rank holding none of a parameter (e.g. with ``BucketedBlockShard``, whose ranks hold
+  contiguous ranges of a bucket, or a parameter with fewer rows than ranks) still emits one
+  piece: a zero-size one just past Megatron's first piece. Without it, rank 0 would save the
+  empty list of pieces in the checkpoint's common state, and positional lists such as the
+  optimizer's ``fp32_from_fp16_params`` would differ in length across ranks, so loading would
+  fail to merge them.
 
 The checkpoint thus has Megatron DDP's keys and global shapes, and the two load each other's.
 """
@@ -90,6 +96,16 @@ class _ChunkPlan:
                         tuple(l + s - g for l, s, g in zip(l_start, start, g_start)),
                     )
                 )
+        if not self.chunks:
+            # This rank holds none of the parameter (an empty shard): one zero-size piece, past
+            # the end of the first piece along an empty dim, where no real chunk starts (DCP
+            # dedups chunks of one key that start at the same offset).
+            assert local_shape.numel() == 0, local_shape
+            r_start, r_size = regions[0]
+            dim = list(local_shape).index(0)
+            start = list(r_start)
+            start[dim] += r_size[dim]
+            self.chunks.append((0, tuple(start), tuple(local_shape), (0,) * len(local_shape)))
         self.regions = regions
 
     @staticmethod
