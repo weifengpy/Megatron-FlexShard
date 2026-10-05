@@ -243,6 +243,40 @@ Setup:
   - FlexShard with no-sync: 10.09292 / 61.558.
   - FlexShard with no-sync and params kept: 10.09299 / 61.576.
 
+### Copy-free BucketedBlockShard (TransformerEngine, 1.4B model, DP 8)
+
+`--flex-shard-bucketed-block-shard` shards each bucket like the distributed optimizer's buffers: parameter-major, with equal contiguous per-rank ranges. The setup is the [Phase A results](#phase-a-results-transformerengine-14b-model-dp-8)' setup: FlexShard without reshard-after-forward, with no-sync and params kept.
+
+GPU-bound, at micro-batch size 4 and seq 4096. FlexShard's copies are GPU time per profiled step on rank 0. Step times are the median ms/it of three runs at 1 microbatch and two at 4.
+
+| Setup | FlexShard copies | 1 microbatch | 4 microbatches |
+| --- | --- | --- | --- |
+| Megatron DDP + distributed optimizer | none | 361.0 | 1347.8 |
+| FlexShard `Shard(0)` | 8.0 ms | 362.4 (+0.4%) | 1354.7 (+0.5%) |
+| `BucketedBlockShard`, flex_shard main | 17.9 ms | 371.7 (+3.0%) | 1363.7 (+1.2%) |
+| `BucketedBlockShard` with flex_shard #38 | 7.8 ms | 361.8 (+0.2%) | 1355.5 (+0.6%) |
+| `BucketedBlockShard` with flex_shard #38 and #39 | 0.2 ms | **355.3 (−1.6%)** | **1346.3 (−0.1%)** |
+
+- **On flex_shard main, `BucketedBlockShard` copied more than `Shard(0)`.**
+  - Its all-gather into a list of per-rank views went through ProcessGroupNCCL's staging buffer and copy-back.
+  - It then copied the gathered bucket into the persistent bucket.
+  - Its reduce filled and copied the full fp32 bucket twice.
+- **#38 drops the staging copy and the second fill and copy,** which only uneven rank ranges need.
+- **#39 drops the rest.**
+  - Unshards after the first gather straight into the persistent bucket the parameters view.
+  - Buckets of fused weight gradients reduce-scatter the gradient bucket their `main_grad` views.
+- **What's left:** the 0.2 ms is the embedding and final-norm buckets. They have no fused weight gradients, so they get no gradient bucket.
+- **Memory:** peak memory matches `Shard(0)`'s, 33.9 GB at 1 microbatch and 39.0 GB at 4.
+- **CPU-bound** (micro-batch size 1, seq 2048, medians of two runs): Megatron 124.3 and 344.4 ms/it, `Shard(0)` 126.3 and 347.1, `BucketedBlockShard` with #38 and #39 117.7 and 338.0, at 1 and 4 microbatches. That is within the 10–20% run-to-run noise of this case.
+
+Correctness:
+- Iteration-1 loss matches Megatron's exactly.
+- A 200-iteration run at micro-batch size 1 and 4 microbatches stays within Megatron's run-to-run spread: largest loss difference 0.0047 from Megatron's second run, against 0.0086 between Megatron's two runs. Final loss is 0.0077, between Megatron's 0.0083 and 0.0076.
+- Checkpoints, on the 4-layer model with untied and tied embeddings:
+  - Resuming from iteration 5 matches the uninterrupted run: iteration 6 exactly, iterations 7–10 within 1e-4, as Megatron's own resume does.
+  - Megatron and FlexShard load each other's iteration-5 weights with the source run's iteration-6 loss and grad norm, exactly.
+  - This needs the checkpoint adapter to emit a zero-size piece on ranks that hold none of a parameter, which `BucketedBlockShard` makes common.
+
 ### Plan
 
 #### Phase A: AdamW, Megatron DDP vs FlexShard
