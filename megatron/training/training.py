@@ -2868,6 +2868,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
             reshard_after_backward=args.flex_shard_reshard_after_backward,
             fp8_param_gather=getattr(args, "flex_shard_fp8_param_gather", False),
             own_matrices=args.optimizer == 'muon',
+            bucket_size=args.ddp_bucket_size,
             placement=args.flex_shard_placement,
         )
     else:
