@@ -12,6 +12,7 @@ from flex_shard.custom_placements import (
     BucketedOwnedSegmentSpec,
     MixedBucketPlacement,
 )
+from flex_shard.custom_placements.block_shard import make_bucketed_block_placement_fn
 from flex_shard.custom_placements.shard import per_param_placements
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
@@ -272,15 +273,37 @@ class FlexShardDataParallel(_BaseDataParallel):
             or (config.overlap_moe_expert_parallel_comm and i in in_layer)
             for i, fqns in enumerate(bucket_fqns)
         ]
+        meshes = [self.expert_device_mesh if expert else self.device_mesh for expert in is_expert]
+        # BucketedBlockShard reduce-scatters a bucket of fused weight gradients as is when
+        # main_grad views it (gradient_bucket): the pre-backward hook then aliases the views
+        # flex_shard allocated instead of allocating each gradient.
+        bucketed_block = [
+            ddp_config.bucketed_block_shard and not has_fp8[i] and not owned[i]
+            for i in range(len(bucket_fqns))
+        ]
+        gradient_bucket = [
+            bucketed_block[i] and uses_main_grad[i]
+            for i in range(len(bucket_fqns))
+        ]
         self.buckets = [
             BucketSpec(
                 fqns,
                 placement_fn=(
                     self._fp8_placement_fn(fp8_fqns)
                     if has_fp8[i]
-                    else (_owned_placement_fn(owners) if owned[i] else per_param_placements)
+                    else (
+                        _owned_placement_fn(owners)
+                        if owned[i]
+                        else (
+                            make_bucketed_block_placement_fn(
+                                dims=(0,), blocks_per_rank=(1,) * meshes[i].size()
+                            )
+                            if bucketed_block[i]
+                            else per_param_placements
+                        )
+                    )
                 ),
-                mesh=self.expert_device_mesh if is_expert[i] else self.device_mesh,
+                mesh=meshes[i],
                 mp_policy=mp_policy,
                 reshard_after_forward=(
                     ddp_config.reshard_after_forward
@@ -297,6 +320,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                     else {}
                 ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
+                gradient_bucket=gradient_bucket[i],
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
@@ -343,6 +367,8 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"deferred buckets={sum(deferred)}, "
             f"fp8 weights={len(fp8_fqns)}, "
             f"owned buckets={sum(owned)}, "
+            f"bucketed block buckets={sum(bucketed_block)}, "
+            f"gradient buckets={sum(gradient_bucket)}, "
             f"single grouped params={num_grouped}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
