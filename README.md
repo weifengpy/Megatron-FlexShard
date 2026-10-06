@@ -7,7 +7,7 @@ This fork of NVIDIA/Megatron-LM (based on `16251ac12`) adds [FlexShard](https://
 ### Requirements
 
 - PyTorch with CUDA and NCCL. Tested with a PyTorch 2.15 dev build on CUDA 13; flex_shard declares `torch>=2.14,<2.15`, but its tests pass on 2.15.
-- flex_shard at or after the `pyproject.toml` pin (`main` at `09dd2dc`, [#40](https://github.com/meta-pytorch/flex_shard/pull/40)). Installing it with dependencies pulls its `torch<2.15` pin. With a checkout, `pip install --no-deps -e <flex_shard>` or `PYTHONPATH=<flex_shard>/src` also work; then install `torchao` separately.
+- flex_shard at or after the `pyproject.toml` pin (`main` at `8f6b1e7`, [#43](https://github.com/meta-pytorch/flex_shard/pull/43)). Installing it with dependencies pulls its `torch<2.15` pin. With a checkout, `pip install --no-deps -e <flex_shard>` or `PYTHONPATH=<flex_shard>/src` also work; then install `torchao` separately.
 - Gradient accumulation fusion (Megatron's default) needs APEX's `fused_weight_gradient_mlp_cuda` for Megatron's own linear layers, including the GPT output layer under the TransformerEngine spec, with or without FlexShard.
 - On Hopper, TransformerEngine's grouped-tensor GEMM (`--moe-use-grouped-tensor`, which single grouped MoE weights need) needs cuBLAS 13.4+ (13.6+ with blockwise FP8), both when TransformerEngine is built and at run time. Otherwise per-expert weights silently fall back to split GEMMs, and single grouped weights raise an error. The grouped-tensor runs here used TransformerEngine 2.21.0.dev0 built against the `nvidia-cublas` 13.8 wheel and loaded through `LD_PRELOAD`, since PyTorch's and TransformerEngine's RPATHs take precedence over `LD_LIBRARY_PATH`.
 
@@ -74,7 +74,6 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 
 - Checkpoints need `--ckpt-format torch_dist`, and don't support FP8 parameter all-gather or single grouped MoE biases yet.
 - Under `torch.compile`, FlexShard falls back to synchronous unshard, so compile isn't used here.
-- With `--overlap-moe-expert-parallel-comm`, `BucketedBlockShard` copies fused weight gradients into its reduce-scatter buffer, since the schedule's `unshard()` allocates the `main_grad` aliases before flex_shard's gradient buckets exist.
 
 ## Benchmark: Megatron DDP vs FlexShard
 
