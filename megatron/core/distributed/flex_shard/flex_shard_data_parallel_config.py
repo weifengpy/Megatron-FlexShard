@@ -35,12 +35,20 @@ class FlexShardDataParallelConfig(DistributedDataParallelConfig):
     embedding and output buckets keep row shards.
     """
 
-    bucketed_block_shard: bool = True
-    """Shard each bucket, except FP8 ones, as one param-major buffer cut into contiguous, equal
-    per-rank ranges at row boundaries (flex_shard's BucketedBlockShard), like the distributed
-    optimizer's buffers, instead of cutting every parameter by rows (Shard(0)). The unsharded
-    parameters then view one bucket buffer: unshards after the first gather straight into it,
-    and buckets of fused weight gradients reduce-scatter the buffer their main_grad views, so
-    neither copies. With own_matrices or single grouped MoE weights, no bucket uses it, nor
-    does a bucket holding a weight tied across pipeline stages.
+    placement: str = "bucketed-block"
+    """Layout of each bucket without one of its own (FP8 buckets and Muon's matrix buckets have
+    theirs). "bucketed-block" shards the bucket as one param-major buffer cut into contiguous,
+    equal per-rank ranges at row boundaries (flex_shard's BucketedBlockShard), like the
+    distributed optimizer's buffers: the unsharded parameters view one bucket buffer, unshards
+    after the first gather straight into it, and buckets of fused weight gradients
+    reduce-scatter the buffer their main_grad views, so neither copies. "shard0" cuts every
+    parameter by rows (Shard(0)). With own_matrices or single grouped MoE weights, buckets use
+    "shard0" instead, as does a bucket holding a weight tied across pipeline stages.
     """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.placement not in ("bucketed-block", "shard0"):
+            raise ValueError(
+                f"placement must be 'bucketed-block' or 'shard0', got {self.placement!r}."
+            )
