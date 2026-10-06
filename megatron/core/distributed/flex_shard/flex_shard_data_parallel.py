@@ -276,14 +276,19 @@ class FlexShardDataParallel(_BaseDataParallel):
         meshes = [self.expert_device_mesh if expert else self.device_mesh for expert in is_expert]
         # BucketedBlockShard reduce-scatters a bucket of fused weight gradients as is when
         # main_grad views it (gradient_bucket): the pre-backward hook then aliases the views
-        # flex_shard allocated instead of allocating each gradient. A bucket holding a weight
-        # tied across pipeline stages (shared_embedding) keeps Shard(0): finalize_model_grads
-        # all-reduces the two copies' local shards, which line up only if both stages cut the
-        # weight alike, and BucketedBlockShard's cuts depend on the rest of each bucket.
+        # flex_shard allocated instead of allocating each gradient. Muon's buckets keep whole
+        # matrices on their owners, and te_grouped.py views a single grouped weight's local rows
+        # as a GroupedTensor, so with either, no bucket uses BucketedBlockShard. A bucket holding
+        # a weight tied across pipeline stages (shared_embedding) keeps Shard(0):
+        # finalize_model_grads all-reduces the two copies' local shards, which line up only if
+        # both stages cut the weight alike, and BucketedBlockShard's cuts depend on the rest of
+        # each bucket.
+        bucketed_block_shard = (
+            ddp_config.bucketed_block_shard and not ddp_config.own_matrices and num_grouped == 0
+        )
         bucketed_block = [
-            ddp_config.bucketed_block_shard
+            bucketed_block_shard
             and not has_fp8[i]
-            and not owned[i]
             and not any(getattr(params[fqn], "shared_embedding", False) for fqn in fqns)
             for i, fqns in enumerate(bucket_fqns)
         ]

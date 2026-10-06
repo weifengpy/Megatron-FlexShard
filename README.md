@@ -19,13 +19,12 @@ This fork of NVIDIA/Megatron-LM (based on `16251ac12`) adds [FlexShard](https://
 | `--flex-shard-no-reshard-after-forward` | Keep gathered parameters from forward until backward (ZeRO-2). |
 | `--flex-shard-no-sync` | With gradient accumulation, reduce-scatter only in the last microbatch's backward. Earlier microbatches accumulate full gradients, at the memory cost of one full gradient copy. |
 | `--flex-shard-no-reshard-after-backward` | With `--flex-shard-no-sync`, keep gathered parameters between microbatches, so without reshard-after-forward only the first microbatch all-gathers. |
-| `--flex-shard-bucketed-block-shard` | Shard each bucket, except FP8 buckets, as one parameter-major buffer cut into equal contiguous per-rank ranges (flex_shard's `BucketedBlockShard`), like the distributed optimizer's buffers, instead of cutting each parameter by rows (`Shard(0)`). After the first gather, unshards and the reduce-scatters of fused weight gradients don't copy. |
+| `--flex-shard-no-bucketed-block-shard` | Cut each parameter by rows (`Shard(0)`) instead of the default `BucketedBlockShard` (see [Design](#design)). Muon and single grouped MoE weights never use `BucketedBlockShard`. |
 
 `validate_args` rejects `--use-flex-shard` with:
 - `--use-distributed-optimizer`, `--overlap-param-gather`, `--use-torch-fsdp2`, `--use-megatron-fsdp` or fp16;
 - optimizers other than Adam, SGD and Muon, and Muon with FP8 parameter all-gather or single grouped MoE weights;
 - `--save` or `--load` with a `--ckpt-format` other than `torch_dist`, with FP8 parameter all-gather, or with single grouped MoE biases;
-- `--flex-shard-bucketed-block-shard` with Muon, or with single grouped MoE weights or biases;
 - `--overlap-moe-expert-parallel-comm` without `--flex-shard-no-reshard-after-forward --flex-shard-no-sync --flex-shard-no-reshard-after-backward`;
 - `--delay-wgrad-compute` without gradient accumulation fusion, and `--overlap-dispatch-backward-with-experts-wgrad` with `--flex-shard-no-sync` but without fusion;
 - single grouped MoE weights or biases (`--moe-single-grouped-weight`, `--moe-single-grouped-bias`) with the TransformerEngine op fuser, with FP8 or FP4, or with delayed weight gradients but without fusion.
@@ -52,7 +51,8 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 
 `FlexShardDataParallel` (`megatron/core/distributed/flex_shard/flex_shard_data_parallel.py`) subclasses `_BaseDataParallel`, like the torch FSDP2 wrapper. `get_megatron_ddp_config` returns a `FlexShardDataParallelConfig` under `--use-flex-shard`, and both `get_model()` and the ModelBuilder path that `pretrain_gpt.py` uses (`_ddp_wrap`) pick the wrapper by that type.
 
-- **Buckets**, in forward order: the embedding, one per `TransformerLayer`, any other parameter-owning modules (e.g. `final_layernorm`), then `output_layer`, split by dtype. Each all-gathers before use and reduce-scatters after backward. By default, parameters are `Shard(0)` over `pg_collection.dp_cp`. The last bucket never reshards after forward, like the FSDP2 root.
+- **Buckets**, in forward order: the embedding, one per `TransformerLayer`, any other parameter-owning modules (e.g. `final_layernorm`), then `output_layer`, split by dtype. Each all-gathers before use and reduce-scatters after backward, over `pg_collection.dp_cp`. The last bucket never reshards after forward, like the FSDP2 root.
+- **Bucket layout.** By default, each bucket except FP8 ones is one parameter-major buffer cut into equal contiguous per-rank ranges at row boundaries (flex_shard's `BucketedBlockShard`), like the distributed optimizer's buffers. After the first gather, unshards gather straight into the buffer the parameters view, and buckets of fused weight gradients reduce-scatter the buffer their `main_grad` views, so neither copies. With `--flex-shard-no-bucketed-block-shard`, Muon or single grouped MoE weights, buckets cut each parameter by rows (`Shard(0)`) instead, as do buckets holding a weight tied across pipeline stages (below). FP8 and Muon matrix buckets have their own placements (below).
 - **Parameters.** FlexShard replaces each parameter with its local shard; the wrapper saves Megatron's per-parameter attributes (`tensor_model_parallel`, `allreduce`, ...) and restores them.
 - **Optimizer.** Megatron's `Float16OptimizerWithFloat16Params` updates the local shards. With `--accumulate-allreduce-grads-in-fp32` (the bf16 default), bf16 parameters get `grad_dtype=torch.float32`, so FlexShard's fp32 local-shard gradients serve as main gradients without a copy. Each gradient element lives on one data-parallel rank, so grad stats (norm, zero count) reduce over WORLD.
 - **Grad sync.** FlexShard reduce-scatters during backward and waits at its end, so `finish_grad_sync` is a no-op and `scale_gradients` scales the local shards. Buckets average over their group, as Megatron DDP scales by 1/DP, or sum with `--calculate-per-token-loss`, where `finalize_model_grads` divides by the global token count.
@@ -74,6 +74,7 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 
 - Checkpoints need `--ckpt-format torch_dist`, and don't support FP8 parameter all-gather or single grouped MoE biases yet.
 - Under `torch.compile`, FlexShard falls back to synchronous unshard, so compile isn't used here.
+- With `--overlap-moe-expert-parallel-comm`, `BucketedBlockShard` copies fused weight gradients into its reduce-scatter buffer, since the schedule's `unshard()` allocates the `main_grad` aliases before flex_shard's gradient buckets exist.
 
 ## Benchmark: Megatron DDP vs FlexShard
 
@@ -102,6 +103,7 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 - **Copies,** GPU time per profiled step on rank 0: `Shard(0)` spends 7.8–8.0 ms, about two thirds of it copying gradients into the reduce-scatter buffer. `BucketedBlockShard` spends 0.2–0.3 ms, on the embedding and final-norm buckets, which have no fused weight gradients. Before flex_shard #38, #42 and #39 (17.9 → 9.9 → 7.5 → 0.3 ms), it ran 3.0% behind Megatron GPU-bound at 1 microbatch.
 - **CPU:** when CPU-bound, both stacks' forwards are bound by kernel launches. FlexShard's forward hooks cost 10.9 ms of CPU per step with `BucketedBlockShard` and 13.1 ms with `Shard(0)`, against Megatron's 5.5 ms (rank 0, 1 microbatch; timing wrappers inflate these), while Megatron's NaN-check host syncs stall its autograd thread.
 - **Memory:** FlexShard uses about 5 GB less at 1 microbatch (33.9 vs 38.8 GB GPU-bound, 8.5 vs 13.4 GB CPU-bound): it frees full gradients after the reduce-scatter, while Megatron keeps a persistent gradient buffer. At 4 microbatches, no-sync keeps them between microbatches, and FlexShard uses 0.1–0.2 GB more.
+- **With reshard-after-forward** (the `--use-flex-shard` default; GPU-bound at 1 microbatch, two runs each), `BucketedBlockShard` takes 361.6 ms/it against `Shard(0)`'s 371.3 (−2.6%), at 31.4 vs 31.5 GB.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 7.7e-3 for `Shard(0)` and 4.7e-3 for `BucketedBlockShard`, against 8.6e-3 between two Megatron runs. With `BucketedBlockShard`, checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
 ### Gradient accumulation (1.4B model, DP 4)
@@ -139,7 +141,7 @@ Protocol: the median ms/it over iterations ≥ 20, the min and median of at leas
 
 ## Composition with Megatron features
 
-Unless noted, iteration-1 loss and grad norm match Megatron DDP + distributed optimizer exactly. "Within Megatron's spread" means FlexShard's loss curve differs from Megatron's about as much as two Megatron runs differ.
+Unless noted, iteration-1 loss and grad norm match Megatron DDP + distributed optimizer exactly. "Within Megatron's spread" means FlexShard's loss curve differs from Megatron's about as much as two Megatron runs differ. These results used `Shard(0)`, the default before `BucketedBlockShard`. `BucketedBlockShard` also matches exactly, through the iteration-2 loss, at DP 8 with and without reshard-after-forward, TP 2 with sequence parallelism, PP 2 with and without virtual chunks and with MTP, CP 2, MTP, full recompute, fusion off, blockwise FP8 parameter all-gather, and on the small MoE model at EP 4 with delayed expert weight gradients and with the EP overlap.
 
 - **Tensor parallelism:** the 117M model at TP 2 × DP 2, with and without sequence parallelism, no-sync, `--qk-layernorm` and `--tp-comm-overlap`. The 1.4B model over 500 iterations at TP 2 × DP 2 and TP 2 × DP 4 with sequence parallelism is within Megatron's spread; at TP 4 × DP 2, where Megatron's runs are bit-identical, its 50-iteration moving average stays within 0.02 of Megatron's. On the 7.2B model at TP 2 × DP 4 (flex_shard #21, fusion off), FlexShard is 14% faster at 1 microbatch (222 vs 259 ms/it, 16.8 vs 30.4 GB) and 3–4.5% faster at 2 and 8 with no-sync, and doesn't need `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 - **Gradient accumulation fusion:** the 117M model, with and without full recompute, and the small MoE model with MoE recompute, including grouped-tensor experts. Still to do: the 7.2B model with fusion.

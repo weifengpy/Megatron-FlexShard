@@ -35,12 +35,12 @@ class FlexShardDataParallelConfig(DistributedDataParallelConfig):
     embedding and output buckets keep row shards.
     """
 
-    bucketed_block_shard: bool = False
-    """Shard each other bucket as one param-major buffer cut into contiguous, equal per-rank
-    ranges at row boundaries (flex_shard's BucketedBlockShard), like the distributed optimizer's
-    buffers, instead of cutting every parameter by rows (Shard(0)). The unsharded parameters
-    then view one bucket buffer, so the all-gather needs no per-parameter copy-out. With a
-    flex_shard that has copy-free refills and gradient buckets, unshards after the first gather
-    straight into that buffer, and buckets of fused weight gradients reduce-scatter the buffer
-    their main_grad views, with no copy-in.
+    bucketed_block_shard: bool = True
+    """Shard each bucket, except FP8 ones, as one param-major buffer cut into contiguous, equal
+    per-rank ranges at row boundaries (flex_shard's BucketedBlockShard), like the distributed
+    optimizer's buffers, instead of cutting every parameter by rows (Shard(0)). The unsharded
+    parameters then view one bucket buffer: unshards after the first gather straight into it,
+    and buckets of fused weight gradients reduce-scatter the buffer their main_grad views, so
+    neither copies. With own_matrices or single grouped MoE weights, no bucket uses it, nor
+    does a bucket holding a weight tied across pipeline stages.
     """
