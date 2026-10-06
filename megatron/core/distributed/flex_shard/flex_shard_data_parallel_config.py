@@ -34,3 +34,13 @@ class FlexShardDataParallelConfig(DistributedDataParallelConfig):
     Muon orthogonalizes complete matrices locally, without optimizer communication. The
     embedding and output buckets keep row shards.
     """
+
+    bucketed_block_shard: bool = False
+    """Shard each other bucket as one param-major buffer cut into contiguous, equal per-rank
+    ranges at row boundaries (flex_shard's BucketedBlockShard), like the distributed optimizer's
+    buffers, instead of cutting every parameter by rows (Shard(0)). The unsharded parameters
+    then view one bucket buffer, so the all-gather needs no per-parameter copy-out. With a
+    flex_shard that has copy-free refills and gradient buckets, unshards after the first gather
+    straight into that buffer, and buckets of fused weight gradients reduce-scatter the buffer
+    their main_grad views, with no copy-in.
+    """

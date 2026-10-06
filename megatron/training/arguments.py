@@ -1068,6 +1068,8 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
+    assert args.use_flex_shard or not args.flex_shard_bucketed_block_shard, \
+        '--flex-shard-bucketed-block-shard requires --use-flex-shard'
     if args.use_flex_shard:
         assert not (args.use_torch_fsdp2 or args.use_megatron_fsdp), \
             '--use-flex-shard cannot be combined with --use-torch-fsdp2 or --use-megatron-fsdp'
@@ -1119,6 +1121,13 @@ def validate_args(args, defaults={}):
             '--use-flex-shard supports only --optimizer adam, sgd or muon'
         assert args.flex_shard_no_sync or args.flex_shard_reshard_after_backward, \
             '--flex-shard-no-reshard-after-backward requires --flex-shard-no-sync'
+        if args.flex_shard_bucketed_block_shard:
+            # Muon's matrix buckets keep whole matrices on their owners (BucketedOwned).
+            assert args.optimizer != 'muon', \
+                '--flex-shard-bucketed-block-shard does not support --optimizer muon'
+            # te_grouped.py views a single grouped weight's local rows as a GroupedTensor.
+            assert not (args.moe_single_grouped_weight or args.moe_single_grouped_bias), \
+                '--flex-shard-bucketed-block-shard does not support single grouped MoE weights'
 
         # With the blockwise recipe, FlexShard keeps bf16 shards and all-gathers
         # TransformerEngine's 128 x 128 blockwise FP8 weights itself, so the model keeps bf16
@@ -3592,6 +3601,11 @@ def _add_distributed_args(parser):
                        help='With --flex-shard-no-sync, keep FlexShard unsharded parameters '
                        'between microbatches, so only the first microbatch all-gathers them '
                        '(without reshard-after-forward).')
+    group.add_argument('--flex-shard-bucketed-block-shard', action='store_true',
+                       help='Shard each FlexShard bucket as one param-major buffer cut into '
+                       'equal contiguous per-rank ranges (flex_shard BucketedBlockShard), like '
+                       'the distributed optimizer, instead of per-parameter Shard(0), so '
+                       'unshards and gradient reductions need no per-bucket copies.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
                        'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
