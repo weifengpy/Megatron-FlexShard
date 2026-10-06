@@ -102,7 +102,6 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 - **Copies,** GPU time per profiled step on rank 0: `Shard(0)` spends 7.8–8.0 ms, about two thirds of it copying gradients into the reduce-scatter buffer. `BucketedBlockShard` spends 0.2–0.3 ms, on the embedding and final-norm buckets, which have no fused weight gradients. Before flex_shard #38, #42 and #39 (17.9 → 9.9 → 7.5 → 0.3 ms), it ran 3.0% behind Megatron GPU-bound at 1 microbatch.
 - **CPU:** when CPU-bound, both stacks' forwards are bound by kernel launches. FlexShard's forward hooks cost 10.9 ms of CPU per step with `BucketedBlockShard` and 13.1 ms with `Shard(0)`, against Megatron's 5.5 ms (rank 0, 1 microbatch; timing wrappers inflate these), while Megatron's NaN-check host syncs stall its autograd thread.
 - **Memory:** FlexShard uses about 5 GB less at 1 microbatch (33.9 vs 38.8 GB GPU-bound, 8.5 vs 13.4 GB CPU-bound): it frees full gradients after the reduce-scatter, while Megatron keeps a persistent gradient buffer. At 4 microbatches, no-sync keeps them between microbatches, and FlexShard uses 0.1–0.2 GB more.
-- **With reshard-after-forward** (the `--use-flex-shard` default; GPU-bound at 1 microbatch, two runs each), `BucketedBlockShard` takes 361.6 ms/it against `Shard(0)`'s 371.3 (−2.6%), at 31.4 vs 31.5 GB.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 7.7e-3 for `Shard(0)` and 4.7e-3 for `BucketedBlockShard`, against 8.6e-3 between two Megatron runs. With `BucketedBlockShard`, checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
 ### Gradient accumulation (1.4B model, DP 4)
@@ -115,11 +114,8 @@ TransformerEngine spec without gradient accumulation fusion, FlexShard with `Sha
 | FlexShard without reshard-after-forward | 216.2 | 795.9 | 9.0 GB |
 | … with no-sync | 206.7 | 710.4 | 13.5 GB |
 | … with no-sync and params kept | **193.2** | **606.3** | 13.5 GB |
-| FlexShard with reshard-after-forward | 239.2 | 875.4 | 6.6 GB |
-| … with no-sync | 228.4 | 792.1 | 11.0 GB |
-| … with no-sync and params kept | 215.4 | 703.8 | 11.0 GB |
 
-With no-sync (`--flex-shard-no-sync`) and params kept (`--flex-shard-no-reshard-after-backward`), FlexShard without reshard-after-forward matches Megatron: +0.3% at 2 microbatches, and −1% to −5% at 8, where Megatron's two repetitions differ by 9%. No-sync costs about 4.5 GB at the peak for the full fp32 gradients. FlexShard with reshard-after-forward stays 10–12% behind, since it re-gathers every bucket in each backward.
+With no-sync (`--flex-shard-no-sync`) and params kept (`--flex-shard-no-reshard-after-backward`), FlexShard without reshard-after-forward matches Megatron: +0.3% at 2 microbatches, and −1% to −5% at 8, where Megatron's two repetitions differ by 9%. No-sync costs about 4.5 GB at the peak for the full fp32 gradients.
 
 ## Plan
 
@@ -134,7 +130,7 @@ Protocol: the median ms/it over iterations ≥ 20, the min and median of at leas
 - Status, on the 117M model at DP 8: iteration-1 loss and grad norm match exactly, and iterations 2–10 differ by up to 1.4e-4 (1.5e-4 with reshard-after-forward), against 9.5e-5 between two Megatron runs. A composition matrix (syncing every microbatch, without fusion, untied embeddings, QKV without the split, MTP, PP 2, TP 2 with sequence parallelism, the small MoE model at EP 4) matches exactly through iteration 2, the first after a Muon step. FlexShard peaks at 1858–1872 MB against Megatron's 1385–1391 MB, from padding: a per-layer bucket has four matrices for eight ranks, so each collective moves about 3.6× the bucket's bytes.
 - Next: Muon buckets spanning several layers, which needs a flex_shard option to hook a bucket on a list of modules; the benchmark, with each stack's Muon-minus-AdamW time; Muon checkpoints; and loss curves on the 1.4B model.
 
-**Phase C:** Megatron-FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params`) vs FlexShard with reshard-after-forward, both ZeRO-3, for models that don't fit with full parameters resident. Measure with Phase A's protocol, then close gaps.
+**Phase C:** Megatron-FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params`) vs FlexShard with reshard-after-forward, both ZeRO-3, for models that don't fit with full parameters resident. Measure with Phase A's protocol, then close gaps. So far, on the 1.4B model with reshard-after-forward (GPU-bound, 1 microbatch), `BucketedBlockShard` takes 361.6 ms/it against `Shard(0)`'s 371.3 (−2.6%), at 31.4 vs 31.5 GB.
 
 **Phase D:** Megatron-FSDP v2, experimental since June 2026 (Megatron-LM [#5387](https://github.com/NVIDIA/Megatron-LM/pull/5387)), is converging on FlexShard's design: per-parameter placements, including whole-tensor ownership like `BucketedOwned`, explicit rank layouts with uneven collectives ([#7670](https://github.com/NVIDIA/Megatron-LM/pull/7670), [#7671](https://github.com/NVIDIA/Megatron-LM/pull/7671)), and owner-based compute planning ([#6597](https://github.com/NVIDIA/Megatron-LM/pull/6597)). Compare it once it trains end to end in Megatron, against Phase C's setup and, if it runs Muon, Phase B's.
 
