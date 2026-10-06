@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import dataclasses
 import functools
 import logging
 from contextlib import contextmanager
@@ -28,10 +27,6 @@ from ...utils import log_single_rank
 from ..data_parallel_base import _BaseDataParallel
 from . import checkpoint_adapter, te_fp8, te_grouped
 from .flex_shard_data_parallel_config import FlexShardDataParallelConfig
-
-# BucketSpec(gradient_bucket=True) needs a flex_shard with copy-free gradient buckets; older
-# ones copy the gradients into each bucket's reduce-scatter input.
-_HAS_GRADIENT_BUCKET = "gradient_bucket" in {f.name for f in dataclasses.fields(BucketSpec)}
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +282,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             for i in range(len(bucket_fqns))
         ]
         gradient_bucket = [
-            _HAS_GRADIENT_BUCKET and bucketed_block[i] and uses_main_grad[i]
+            bucketed_block[i] and uses_main_grad[i]
             for i in range(len(bucket_fqns))
         ]
         self.buckets = [
@@ -325,7 +320,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                     else {}
                 ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
-                **(dict(gradient_bucket=True) if gradient_bucket[i] else {}),
+                gradient_bucket=gradient_bucket[i],
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
