@@ -3592,14 +3592,15 @@ def _add_distributed_args(parser):
                        help='With --flex-shard-no-sync, keep FlexShard unsharded parameters '
                        'between microbatches, so only the first microbatch all-gathers them '
                        '(without reshard-after-forward).')
-    group.add_argument('--flex-shard-no-bucketed-block-shard', action='store_false',
-                       dest='flex_shard_bucketed_block_shard',
-                       help='Cut each FlexShard parameter by rows (Shard(0)) instead of the '
-                       'default flex_shard BucketedBlockShard, which shards each bucket as one '
-                       'param-major buffer cut into equal contiguous per-rank ranges, like the '
-                       'distributed optimizer, and needs no per-bucket copies in unshards and '
-                       'gradient reductions. Muon and single grouped MoE weights never use '
-                       'BucketedBlockShard.')
+    group.add_argument('--flex-shard-placement', type=str, default='bucketed-block',
+                       choices=['bucketed-block', 'shard0'],
+                       help='Layout of each FlexShard bucket without one of its own (FP8 and '
+                       'Muon matrix buckets have theirs). bucketed-block (flex_shard '
+                       'BucketedBlockShard) shards the bucket as one param-major buffer cut into '
+                       'equal contiguous per-rank ranges, like the distributed optimizer, and '
+                       'needs no per-bucket copies in unshards and gradient reductions; shard0 '
+                       'cuts each parameter by rows (Shard(0)). Muon and single grouped MoE '
+                       'weights always use shard0.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
                        help='Inter-gpu communication type for context parallelism: '
                        'p2p, a2a, allgather or a2a+p2p. If a single string is provided, '
