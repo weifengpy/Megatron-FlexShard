@@ -205,6 +205,12 @@ class FlexShardDataParallel(_BaseDataParallel):
         )
         tied = self._find_tied_output_weight()
         bucket_fqns = self._build_bucket_fqns(tied)
+        # With Muon, consecutive layers share a bucket, hooked on those layers.
+        bucket_modules: List[Optional[List[str]]] = [None] * len(bucket_fqns)
+        if ddp_config.own_matrices and not config.overlap_moe_expert_parallel_comm:
+            bucket_fqns, bucket_modules = self._group_muon_layers(
+                bucket_fqns, ddp_config.bucket_size
+            )
         tied_bucket = None
         if tied is not None:
             weight_fqn, output_layer_path = tied
@@ -333,6 +339,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                     else {}
                 ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
+                **(dict(modules=bucket_modules[i]) if bucket_modules[i] else {}),
                 gradient_bucket=gradient_bucket[i],
             )
             for i, fqns in enumerate(bucket_fqns)
@@ -380,6 +387,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"deferred buckets={sum(deferred)}, "
             f"fp8 weights={len(fp8_fqns)}, "
             f"owned buckets={sum(owned)}, "
+            f"multi-layer buckets={sum(modules is not None for modules in bucket_modules)}, "
             f"bucketed block buckets={sum(bucketed_block)}, "
             f"gradient buckets={sum(gradient_bucket)}, "
             f"single grouped params={num_grouped}, "
@@ -582,6 +590,63 @@ class FlexShardDataParallel(_BaseDataParallel):
                 groups.setdefault(key, []).append(fqn)
             split_buckets.extend(groups.values())
         return split_buckets
+
+    def _group_muon_layers(
+        self, bucket_fqns: List[List[str]], bucket_size: Optional[int]
+    ) -> Tuple[List[List[str]], List[Optional[List[str]]]]:
+        """Merge runs of consecutive TransformerLayer buckets holding Muon matrices into buckets
+        of several layers, each hooked on its layers (flex_shard's BucketSpec.modules).
+
+        Muon's whole matrices on owner ranks pad every rank's share of a bucket to the largest
+        one, so a one-layer bucket (four matrices for eight ranks) moves several times its
+        bytes. Megatron's layer-wise distributed Muon closes a bucket, walking in backprop
+        order, once it holds max(bucket_size, 0.9 x DP x its largest matrix) elements; this does
+        the same with whole layers, since a bucket's hooks sit on whole layers. MoE layers
+        alternate with their experts' buckets, so they stay one per layer.
+        """
+        params = dict(self.module.named_parameters())
+        dp_size = self.device_mesh.size()
+        if bucket_size is None:
+            # Megatron DDP's default (DistributedDataParallel).
+            bucket_size = max(40000000, 1000000 * dp_size)
+
+        def is_muon_layer(fqns: List[str]) -> bool:
+            return (
+                isinstance(self.module.get_submodule(_common_module_path(fqns)), TransformerLayer)
+                and any(_is_muon_matrix(params[fqn]) for fqn in fqns)
+                and not any(_is_expert_param(params[fqn]) for fqn in fqns)
+            )
+
+        grouped_fqns: List[List[str]] = []
+        grouped_modules: List[Optional[List[str]]] = []
+        start = 0
+        while start < len(bucket_fqns):
+            end = start
+            while end < len(bucket_fqns) and is_muon_layer(bucket_fqns[end]):
+                end += 1
+            if end == start:
+                grouped_fqns.append(bucket_fqns[start])
+                grouped_modules.append(None)
+                start += 1
+                continue
+            groups: List[List[List[str]]] = [[]]
+            for layer in reversed(bucket_fqns[start:end]):
+                if groups[0]:
+                    fqns = [fqn for group_layer in groups[0] for fqn in group_layer]
+                    numel = sum(params[fqn].numel() for fqn in fqns)
+                    largest = max(
+                        params[fqn].numel() for fqn in fqns if _is_muon_matrix(params[fqn])
+                    )
+                    if numel >= max(bucket_size, int(0.9 * dp_size * largest)):
+                        groups.insert(0, [])
+                groups[0].insert(0, layer)
+            for group in groups:
+                grouped_fqns.append([fqn for layer in group for fqn in layer])
+                grouped_modules.append(
+                    [_common_module_path(layer) for layer in group] if len(group) > 1 else None
+                )
+            start = end
+        return grouped_fqns, grouped_modules
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple = (), metadata=None):
         """The wrapped module's sharded state dict, of FlexShard's local shards, with Megatron
