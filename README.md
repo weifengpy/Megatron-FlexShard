@@ -104,19 +104,6 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 - **Memory:** FlexShard uses about 5 GB less at 1 microbatch (33.9 vs 38.8 GB GPU-bound, 8.5 vs 13.4 GB CPU-bound): it frees full gradients after the reduce-scatter, while Megatron keeps a persistent gradient buffer. At 4 microbatches, no-sync keeps them between microbatches, and FlexShard uses 0.1–0.2 GB more.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 7.7e-3 for `Shard(0)` and 4.7e-3 for `BucketedBlockShard`, against 8.6e-3 between two Megatron runs. With `BucketedBlockShard`, checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
-### Gradient accumulation (1.4B model, DP 4)
-
-TransformerEngine spec without gradient accumulation fusion, FlexShard with `Shard(0)` (these runs predate `BucketedBlockShard`), 4x H100, micro-batch size 1, 2 and 8 microbatches (GBS 8 and 32). Each cell is the mean of two repetitions of the median ms/it over iterations ≥ 20.
-
-| Setup | GBS 8 ms/it | GBS 32 ms/it | Max allocated |
-| --- | --- | --- | --- |
-| Megatron DDP + distributed optimizer | 192.6 | 640.7 | 12.9 GB |
-| FlexShard without reshard-after-forward | 216.2 | 795.9 | 9.0 GB |
-| … with no-sync | 206.7 | 710.4 | 13.5 GB |
-| … with no-sync and params kept | **193.2** | **606.3** | 13.5 GB |
-
-With no-sync (`--flex-shard-no-sync`) and params kept (`--flex-shard-no-reshard-after-backward`), FlexShard without reshard-after-forward matches Megatron: +0.3% at 2 microbatches, and −1% to −5% at 8, where Megatron's two repetitions differ by 9%. No-sync costs about 4.5 GB at the peak for the full fp32 gradients.
-
 ## Plan
 
 **Phase A (AdamW).** The 1.4B model results above cover the matched configuration, a 200-iteration correctness gate and performance. Next:
