@@ -205,10 +205,10 @@ class FlexShardDataParallel(_BaseDataParallel):
         )
         tied = self._find_tied_output_weight()
         bucket_fqns = self._build_bucket_fqns(tied)
-        # With Muon, consecutive layers share a bucket, hooked on those layers.
-        bucket_modules: List[Optional[List[str]]] = [None] * len(bucket_fqns)
+        # With Muon, consecutive layers share a bucket, which names them.
+        bucket_layers: List[Optional[List[str]]] = [None] * len(bucket_fqns)
         if ddp_config.own_matrices and not config.overlap_moe_expert_parallel_comm:
-            bucket_fqns, bucket_modules = self._group_muon_layers(
+            bucket_fqns, bucket_layers = self._group_muon_layers(
                 bucket_fqns, ddp_config.bucket_size
             )
         tied_bucket = None
@@ -306,7 +306,8 @@ class FlexShardDataParallel(_BaseDataParallel):
         ]
         self.buckets = [
             BucketSpec(
-                fqns,
+                # A bucket of several layers names them: flex_shard hooks it on their forwards.
+                bucket_layers[i] or fqns,
                 placement_fn=(
                     self._fp8_placement_fn(fp8_fqns)
                     if has_fp8[i]
@@ -339,7 +340,6 @@ class FlexShardDataParallel(_BaseDataParallel):
                     else {}
                 ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
-                **(dict(modules=bucket_modules[i]) if bucket_modules[i] else {}),
                 gradient_bucket=gradient_bucket[i],
             )
             for i, fqns in enumerate(bucket_fqns)
@@ -387,7 +387,6 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"deferred buckets={sum(deferred)}, "
             f"fp8 weights={len(fp8_fqns)}, "
             f"owned buckets={sum(owned)}, "
-            f"multi-layer buckets={sum(modules is not None for modules in bucket_modules)}, "
             f"bucketed block buckets={sum(bucketed_block)}, "
             f"gradient buckets={sum(gradient_bucket)}, "
             f"single grouped params={num_grouped}, "
@@ -595,7 +594,8 @@ class FlexShardDataParallel(_BaseDataParallel):
         self, bucket_fqns: List[List[str]], bucket_size: Optional[int]
     ) -> Tuple[List[List[str]], List[Optional[List[str]]]]:
         """Merge runs of consecutive TransformerLayer buckets holding Muon matrices into buckets
-        of several layers, each hooked on its layers (flex_shard's BucketSpec.modules).
+        of several layers, returned with the layers' module names, which the merged buckets
+        use as patterns so that flex_shard hooks them on those layers' forwards.
 
         Muon's whole matrices on owner ranks pad every rank's share of a bucket to the largest
         one, so a one-layer bucket (four matrices for eight ranks) moves several times its
@@ -611,14 +611,18 @@ class FlexShardDataParallel(_BaseDataParallel):
             bucket_size = max(40000000, 1000000 * dp_size)
 
         def is_muon_layer(fqns: List[str]) -> bool:
+            # The whole layer, which a module pattern names.
+            path = _common_module_path(fqns)
+            layer = self.module.get_submodule(path)
             return (
-                isinstance(self.module.get_submodule(_common_module_path(fqns)), TransformerLayer)
+                isinstance(layer, TransformerLayer)
+                and len(fqns) == len(list(layer.parameters()))
                 and any(_is_muon_matrix(params[fqn]) for fqn in fqns)
                 and not any(_is_expert_param(params[fqn]) for fqn in fqns)
             )
 
         grouped_fqns: List[List[str]] = []
-        grouped_modules: List[Optional[List[str]]] = []
+        grouped_layers: List[Optional[List[str]]] = []
         start = 0
         while start < len(bucket_fqns):
             end = start
@@ -626,7 +630,7 @@ class FlexShardDataParallel(_BaseDataParallel):
                 end += 1
             if end == start:
                 grouped_fqns.append(bucket_fqns[start])
-                grouped_modules.append(None)
+                grouped_layers.append(None)
                 start += 1
                 continue
             groups: List[List[List[str]]] = [[]]
@@ -642,11 +646,11 @@ class FlexShardDataParallel(_BaseDataParallel):
                 groups[0].insert(0, layer)
             for group in groups:
                 grouped_fqns.append([fqn for layer in group for fqn in layer])
-                grouped_modules.append(
+                grouped_layers.append(
                     [_common_module_path(layer) for layer in group] if len(group) > 1 else None
                 )
             start = end
-        return grouped_fqns, grouped_modules
+        return grouped_fqns, grouped_layers
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple = (), metadata=None):
         """The wrapped module's sharded state dict, of FlexShard's local shards, with Megatron
