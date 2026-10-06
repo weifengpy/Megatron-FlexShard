@@ -164,11 +164,9 @@ Setup:
 - **FlexShard matches Megatron.** Compute is the same in both, about 120 ms of forward and 220 ms of backward per micro-batch.
 - **Little communication is exposed.** At 1 microbatch, Megatron exposes 1.2 ms of all-gather and 4.5 ms of reduce-scatter, against FlexShard's 2.6 and 4.8 ms.
 - **At 4 microbatches,** FlexShard waits 9.9 ms at the end of the last backward for its reduce-scatters to drain, which is the +0.7%.
-- **FlexShard's collectives still run slower, hidden behind compute.**
-  - All-gathers run at about half Megatron's bandwidth: 101 vs 199 GB/s at 1 microbatch.
-  - Reduce-scatters run at 57–66%: 134 vs 237 GB/s, and 95 vs 144 GB/s at 4 microbatches.
-  - In isolation, this node does the same all-gather in 0.30 ms (about 300 GB/s) and the reduce-scatter in 0.56 ms (about 320 GB/s).
-  - The gap would surface where communication is harder to hide: across nodes, at larger DP, or with less compute per step.
+- **Once every rank has joined, the collectives move data as fast as Megatron's.** From all 8 ranks' traces at 1 microbatch, all-gathers transfer at 259 vs 256 GB/s, and reduce-scatters at 284 vs 325 GB/s.
+  - Rank 0's collective kernel time also counts waiting for the slowest rank: 17.7 ms of all-gather waiting per step, against Megatron's 10.3.
+  - Both stacks pause the CPU for about 10 ms roughly once per microbatch per rank. FlexShard's CPU runs about 11 ms ahead of its GPU, against Megatron's 17, so more of its pauses stall the GPU and the other ranks wait.
 - **Memory:** FlexShard uses 13% less without no-sync's full gradients (1 microbatch), and the same with them.
 
 **CPU-bound contrast: micro-batch size 1, seq 2048**
@@ -178,10 +176,12 @@ Setup:
 | 1 (GBS 8) | 116.3 | 130.5 | +12.2% | 13.4 / 8.5 GB |
 | 4 (GBS 32) | 352.2 | 369.5 | +4.9% | 13.4 / 13.6 GB |
 
+These are single runs. A later session measured −4.6% at 1 microbatch and +4.6% at 4, so single CPU-bound runs vary across sessions by more than the gap; the [rerun](#phase-a-rerun-with-copy-free-bucketedblockshard-transformerengine-14b-model-dp-8) has three runs per cell.
+
 - **The forward is bound by kernel launches in both stacks.** With 2048 tokens per micro-batch, a layer's forward is about 0.8 ms of GPU work but 2.3 ms (Megatron) and 2.8 ms (FlexShard) of CPU work to launch. These come from profiled steps, and the profiler's shape recording adds some CPU time.
 - **Each forward all-gather waits for the slowest rank.** Once every rank has launched it, it takes 0.25 ms. But ranks start it a median of 2.1 ms (Megatron) and 2.6 ms (FlexShard) apart, and the same rank arrives last for every all-gather in a run.
-- **FlexShard's per-bucket hooks add about 0.5 ms of CPU per layer,** which is most of the gap at 1 microbatch. Most of it is copying each gathered bucket into the persistent unsharded params: `Shard(0)` gathers rank-major, while Megatron's params are views into its flat buffer.
-- **At 4 microbatches, the gap is mostly the last backward's reduce-scatters.** FlexShard's run at about 78 GB/s against Megatron's 203, and end with a 36.5 ms drain against 12 ms.
+- **FlexShard's per-bucket hooks add about 0.5 ms of CPU per layer.** Copying each gathered bucket into the persistent unsharded params is only about 0.1 ms of it. The rest is starting the next bucket's all-gather and the per-bucket bookkeeping: version counters, storage, and the input-gradient trigger.
+- **At 4 microbatches, the gap is mostly the last backward's reduce-scatters waiting for the slowest rank.** With no-sync, no collectives run in the first three microbatches, so ranks drift apart: the last backward's first reduce-scatter waits up to 43–51 ms, against 21–30 ms for Megatron, and the step ends with a 36.5 ms drain against 12 ms. Once all ranks have joined, FlexShard's reduce-scatters transfer faster than Megatron's here, 400 vs 309–315 GB/s.
 
 **Correctness gate** (200 iterations at micro-batch size 1, 4 microbatches, lr 1e-4 with 20 warmup iterations):
 - FlexShard's largest loss difference from Megatron, 7.7e-3, is smaller than the largest difference between two Megatron runs, 8.6e-3.
