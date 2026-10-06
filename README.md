@@ -88,7 +88,7 @@ Setup: 8x H100 96 GB, TP = PP = 1, mock data. Models:
 
 ### Phase A results (1.4B model, DP 8)
 
-TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Each run is 15 iterations, timed as the median ms/it over iterations 7–15, and a cell is the median of two runs (GPU-bound: micro-batch size 4, seq 4096) or three (CPU-bound: micro-batch size 1, seq 2048). `BucketedBlockShard` uses flex_shard #38, #42 and #39.
+TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Each run is 15 iterations, timed as the median ms/it over iterations 7–15, and a cell is the median of two runs (GPU-bound: micro-batch size 4, seq 4096) or three (CPU-bound: micro-batch size 1, seq 2048). `BucketedBlockShard`, now the default, uses flex_shard #38, #42 and #39; `Shard(0)` is `--flex-shard-placement shard0`.
 
 | Case | Megatron DDP + distributed optimizer, ms/it | FlexShard `Shard(0)` | FlexShard `BucketedBlockShard` |
 | --- | --- | --- | --- |
@@ -107,7 +107,7 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 
 ### Gradient accumulation (1.4B model, DP 4)
 
-TransformerEngine spec without gradient accumulation fusion, 4x H100, micro-batch size 1, 2 and 8 microbatches (GBS 8 and 32). Each cell is the mean of two repetitions of the median ms/it over iterations ≥ 20.
+TransformerEngine spec without gradient accumulation fusion, FlexShard with `Shard(0)` (these runs predate `BucketedBlockShard`), 4x H100, micro-batch size 1, 2 and 8 microbatches (GBS 8 and 32). Each cell is the mean of two repetitions of the median ms/it over iterations ≥ 20.
 
 | Setup | GBS 8 ms/it | GBS 32 ms/it | Max allocated |
 | --- | --- | --- | --- |
