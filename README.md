@@ -16,7 +16,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 - Delayed expert weight gradients (`--overlap-dispatch-backward-with-experts-wgrad`) need [#33](https://github.com/meta-pytorch/flex_shard/pull/33) (`BucketSpec.defer_post_backward`).
 - The EP all-to-all overlap (`--overlap-moe-expert-parallel-comm`) needs [#34](https://github.com/meta-pytorch/flex_shard/pull/34) (`FlexShardModule.unshard`).
 - Pipeline parallelism with `--flex-shard-no-sync` needs [#32](https://github.com/meta-pytorch/flex_shard/pull/32) (`finalize_backward`) for the default `--align-grad-reduce`.
-- `--flex-shard-bucketed-block-shard` runs with any flex_shard. It drops its per-bucket copies with [#38](https://github.com/meta-pytorch/flex_shard/pull/38) (no staging copies with equal rank ranges) and [#39](https://github.com/meta-pytorch/flex_shard/pull/39) (copy-free refills and gradient buckets, `BucketSpec.gradient_bucket`, which FlexShard detects at import).
+- `--flex-shard-bucketed-block-shard` runs with any flex_shard. It drops its per-bucket copies with [#38](https://github.com/meta-pytorch/flex_shard/pull/38) (no staging copies with equal rank ranges), [#42](https://github.com/meta-pytorch/flex_shard/pull/42) (refills gather straight into the persistent bucket) and [#39](https://github.com/meta-pytorch/flex_shard/pull/39) (gradient buckets, `BucketSpec.gradient_bucket`, which FlexShard detects at import).
 - TransformerEngine's grouped-tensor GEMM (`--moe-use-grouped-tensor`, which single grouped MoE weights need) runs on Hopper only with a TransformerEngine built against cuBLAS 13.4+ and with cuBLAS 13.4+ at run time, 13.6+ with blockwise FP8. Otherwise TransformerEngine silently runs per-expert weights on its split GEMMs, and single grouped weights raise an error. This node's CUDA 13.0 and 13.1 ship cuBLAS 13.1 and 13.2. So the grouped-tensor runs below used a TransformerEngine 2.21.0.dev0 rebuilt against the `nvidia-cublas` 13.8 wheel, with that cuBLAS loaded through `LD_PRELOAD`, since PyTorch's and TransformerEngine's RPATHs take precedence over `LD_LIBRARY_PATH`.
 
 ### Flags
@@ -254,16 +254,15 @@ GPU-bound, at micro-batch size 4 and seq 4096. FlexShard's copies are GPU time p
 | Megatron DDP + distributed optimizer | none | 361.0 | 1347.8 |
 | FlexShard `Shard(0)` | 8.0 ms | 362.4 (+0.4%) | 1354.7 (+0.5%) |
 | `BucketedBlockShard`, flex_shard main | 17.9 ms | 371.7 (+3.0%) | 1363.7 (+1.2%) |
-| `BucketedBlockShard` with flex_shard #38 and #39 | 0.3 ms | **355.3 (−1.6%)** | **1346.3 (−0.1%)** |
+| `BucketedBlockShard` with flex_shard #38, #42 and #39 | 0.3 ms | **355.3 (−1.6%)** | **1346.3 (−0.1%)** |
 
 - **On flex_shard main, `BucketedBlockShard` copied more than `Shard(0)`.**
   - Its all-gather into a list of per-rank views went through ProcessGroupNCCL's staging buffer and copy-back.
   - It then copied the gathered bucket into the persistent bucket.
   - Its reduce filled and copied the full fp32 bucket twice.
 - **#38 drops the staging copy and the second fill and copy,** which only uneven rank ranges need. Copies go from 17.9 to 9.9 ms.
-- **#39 drops the rest.**
-  - Unshards after the first gather straight into the persistent bucket the parameters view.
-  - Buckets of fused weight gradients reduce-scatter the gradient bucket their `main_grad` views.
+- **#42 gathers refills straight into the persistent bucket** the parameters view, after the first unshard. Copies go from 9.9 to 7.5 ms.
+- **#39 reduce-scatters gradient buckets as is:** buckets of fused weight gradients reduce-scatter the gradient bucket their `main_grad` views. Copies go from 7.5 to 0.3 ms.
 - **What's left:** the 0.3 ms is the embedding and final-norm buckets. They have no fused weight gradients, so they get no gradient bucket.
 - **Memory:** peak memory matches `Shard(0)`'s, 33.9 GB at 1 microbatch and 39.0 GB at 4.
 - **CPU-bound** (micro-batch size 1, seq 2048, medians of two runs): Megatron 124.3 and 344.4 ms/it, `Shard(0)` 126.3 and 347.1, `BucketedBlockShard` with #38 and #39 117.7 and 338.0, at 1 and 4 microbatches. That is within the 10–20% run-to-run noise of this case.
