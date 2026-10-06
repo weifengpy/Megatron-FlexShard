@@ -284,7 +284,9 @@ class FlexShardDataParallel(_BaseDataParallel):
         # both stages cut the weight alike, and BucketedBlockShard's cuts depend on the rest of
         # each bucket.
         bucketed_block_shard = (
-            ddp_config.bucketed_block_shard and not ddp_config.own_matrices and num_grouped == 0
+            ddp_config.placement == "bucketed-block"
+            and not ddp_config.own_matrices
+            and num_grouped == 0
         )
         bucketed_block = [
             bucketed_block_shard
