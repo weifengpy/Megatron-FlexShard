@@ -16,6 +16,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 - Delayed expert weight gradients (`--overlap-dispatch-backward-with-experts-wgrad`) need [#33](https://github.com/meta-pytorch/flex_shard/pull/33) (`BucketSpec.defer_post_backward`).
 - The EP all-to-all overlap (`--overlap-moe-expert-parallel-comm`) needs [#34](https://github.com/meta-pytorch/flex_shard/pull/34) (`FlexShardModule.unshard`).
 - Pipeline parallelism with `--flex-shard-no-sync` needs [#32](https://github.com/meta-pytorch/flex_shard/pull/32) (`finalize_backward`) for the default `--align-grad-reduce`.
+- `--flex-shard-bucketed-block-shard` runs with any flex_shard. It drops its per-bucket copies with [#38](https://github.com/meta-pytorch/flex_shard/pull/38) (no staging copies with equal rank ranges), [#42](https://github.com/meta-pytorch/flex_shard/pull/42) (refills gather straight into the persistent bucket) and [#39](https://github.com/meta-pytorch/flex_shard/pull/39) (gradient buckets, `BucketSpec.gradient_bucket`, which FlexShard detects at import).
 - TransformerEngine's grouped-tensor GEMM (`--moe-use-grouped-tensor`, which single grouped MoE weights need) runs on Hopper only with a TransformerEngine built against cuBLAS 13.4+ and with cuBLAS 13.4+ at run time, 13.6+ with blockwise FP8. Otherwise TransformerEngine silently runs per-expert weights on its split GEMMs, and single grouped weights raise an error. This node's CUDA 13.0 and 13.1 ship cuBLAS 13.1 and 13.2. So the grouped-tensor runs below used a TransformerEngine 2.21.0.dev0 rebuilt against the `nvidia-cublas` 13.8 wheel, with that cuBLAS loaded through `LD_PRELOAD`, since PyTorch's and TransformerEngine's RPATHs take precedence over `LD_LIBRARY_PATH`.
 
 ### Flags
@@ -26,6 +27,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 | `--flex-shard-no-reshard-after-forward` | Keep gathered parameters from forward until backward (ZeRO-2). |
 | `--flex-shard-no-sync` | With gradient accumulation, reduce-scatter only in the last microbatch's backward. Earlier microbatches accumulate full gradients (fp32 with `--accumulate-allreduce-grads-in-fp32`, the bf16 default), at the memory cost of one full gradient copy. |
 | `--flex-shard-no-reshard-after-backward` | With `--flex-shard-no-sync`, keep gathered parameters between microbatches, so only the first microbatch all-gathers (without reshard-after-forward). |
+| `--flex-shard-bucketed-block-shard` | Shard each bucket, other than Muon's whole-matrix and FP8 buckets, as one parameter-major buffer cut into equal contiguous per-rank ranges at row boundaries (flex_shard's `BucketedBlockShard`), like the distributed optimizer's buffers, instead of cutting each parameter by rows (`Shard(0)`). Unshards after the first gather straight into the buffer the parameters view, and buckets of fused weight gradients reduce-scatter the buffer their `main_grad` views, so neither copies. |
 
 `validate_args` rejects combining `--use-flex-shard` with any of:
 - `--overlap-moe-expert-parallel-comm` without `--flex-shard-no-reshard-after-forward --flex-shard-no-sync --flex-shard-no-reshard-after-backward`
@@ -36,6 +38,7 @@ Base: upstream NVIDIA/Megatron-LM `16251ac12` plus one commit, "Add FlexShard da
 - optimizers other than Adam, SGD and Muon, and Muon with FP8 parameter all-gather or single grouped MoE weights
 - `--use-torch-fsdp2` or `--use-megatron-fsdp`
 - `--save` or `--load` with a `--ckpt-format` other than `torch_dist`, with FP8 parameter all-gather, or with single grouped MoE biases
+- `--flex-shard-bucketed-block-shard` with `--optimizer muon`, or with single grouped MoE weights or biases
 
 ### Example
 
