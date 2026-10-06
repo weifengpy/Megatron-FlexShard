@@ -30,7 +30,7 @@ dependencies = [
     "numpy",
     "packaging>=24.2",
     # FlexShard data parallelism (megatron/core/distributed/flex_shard).
-    "flex-shard @ git+https://github.com/meta-pytorch/flex_shard.git@09dd2dcbc87205d4a7bb43d7211d357e623cd4a7",
+    "flex-shard @ git+https://github.com/meta-pytorch/flex_shard.git@8f6b1e7a55f8ff2163a0195f5ab9ec6eb3138312",
 ]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
