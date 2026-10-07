@@ -282,8 +282,9 @@ class FlexShardDataParallel(_BaseDataParallel):
         meshes = [self.expert_device_mesh if expert else self.device_mesh for expert in is_expert]
         # BucketedBlockShard reduce-scatters a bucket of fused weight gradients as is when
         # main_grad views it (gradient_bucket): the pre-backward hook then aliases the views
-        # flex_shard allocated instead of allocating each gradient. Muon's buckets keep whole
-        # matrices on their owners, and te_grouped.py views a single grouped weight's local rows
+        # flex_shard allocated instead of allocating each gradient. Muon's buckets do too, their
+        # parameters viewing their owners' rows of the gathered bucket. They keep whole matrices
+        # on their owners, though, and te_grouped.py views a single grouped weight's local rows
         # as a GroupedTensor, so with either, no bucket uses BucketedBlockShard. A bucket holding
         # a weight tied across pipeline stages (shared_embedding) keeps Shard(0):
         # finalize_model_grads all-reduces the two copies' local shards, which line up only if
@@ -301,7 +302,7 @@ class FlexShardDataParallel(_BaseDataParallel):
             for i, fqns in enumerate(bucket_fqns)
         ]
         gradient_bucket = [
-            bucketed_block[i] and uses_main_grad[i]
+            (bucketed_block[i] or owned[i]) and uses_main_grad[i]
             for i in range(len(bucket_fqns))
         ]
         self.buckets = [
