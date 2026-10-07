@@ -15,28 +15,28 @@ Setup: 8x H100 96 GB, TP = PP = 1, mock data. Models:
 
 ### Phase A results (1.4B model, DP 8)
 
-TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Runs are GPU-bound (micro-batch size 4, seq 4096) with 4 microbatches (GBS 128), 15 iterations each, timed as the median ms/it over iterations 7–15; a cell is the median of two runs. FlexShard uses its default `BucketedBlockShard` layout.
+TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Runs are GPU-bound (micro-batch size 4, seq 4096) with 4 microbatches (GBS 128), 15 iterations each, timed as the median ms/it over iterations 7–15; a cell is the median of two interleaved runs. FlexShard uses its default `BucketedBlockShard` layout. Both stacks do the same work per step: Megatron adds `--ddp-average-in-collective --no-check-for-nan-in-loss-and-grad` and FlexShard `--no-check-for-nan-in-loss-and-grad` (see below).
 
 | Case | Megatron DDP + distributed optimizer, ms/it | FlexShard |
 | --- | --- | --- |
-| GPU-bound, 4 microbatches (GBS 128) | 1345.2 | 1346.0 (+0.1%) |
+| GPU-bound, 4 microbatches (GBS 128) | 1330.9 | 1332.0 (+0.1%) |
 
 - **FlexShard matches Megatron.**
-- **Megatron's defaults do work FlexShard skips.** Before each reduce-scatter, Megatron scales the gradients by 1/DP in a separate kernel (4.8 ms of GPU time per step; FlexShard averages inside the collective, as `--ddp-average-in-collective` does) and checks them for NaN (2.9 ms and 52 host syncs per step). Without that, Megatron would take an estimated 1337.5 ms/it, putting FlexShard about 0.6% behind (from one profiled step).
+- **Matched work:** before each reduce-scatter, Megatron's defaults scale the gradients by 1/DP in a separate kernel (4.8 ms of GPU time per step; FlexShard averages inside the collective, as `--ddp-average-in-collective` does) and check them for NaN (2.9 ms and 52 host syncs per step), which the flags above turn off; `--no-check-for-nan-in-loss-and-grad` also turns off a loss check both stacks run. With Megatron's defaults, FlexShard took 1346.0 ms/it against 1345.2 (+0.1%), in an earlier session.
 - **Copies:** FlexShard spends 0.2–0.3 ms of GPU time per profiled step on copies (rank 0), on the embedding and final-norm buckets, which have no fused weight gradients. flex_shard #38, #42 and #39 took it from 17.9 to 9.9, 7.5 and 0.3 ms.
 - **Memory:** FlexShard uses 0.1–0.2 GB more: no-sync keeps full gradients between microbatches, as Megatron's persistent gradient buffer does.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 4.7e-3, against 8.6e-3 between two Megatron runs. Checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
 ### Phase B results (1.4B model, DP 8)
 
-Phase A's setup with `--optimizer muon` on both sides: Megatron DDP + layer-wise distributed Muon vs FlexShard, each GPU-bound run against a Megatron run from the same session. Both run Megatron's `TensorParallelMuon` (Emerging-Optimizers v0.3.0, Megatron's pin) on whole matrices on their owner ranks, so they compute the same update; Megatron all-gathers parameters after the step, FlexShard in the next forward. torchtitan's DistMuon computes a different update, so FlexShard runs Megatron's.
+Phase A's setup, matched work included, with `--optimizer muon` on both sides: Megatron DDP + layer-wise distributed Muon vs FlexShard. Both run Megatron's `TensorParallelMuon` (Emerging-Optimizers v0.3.0, Megatron's pin) on whole matrices on their owner ranks, so they compute the same update; Megatron all-gathers parameters after the step, FlexShard in the next forward. torchtitan's DistMuon computes a different update, so FlexShard runs Megatron's.
 
 | Case | Megatron DDP + layer-wise distributed Muon, ms/it | FlexShard |
 | --- | --- | --- |
-| GPU-bound, 4 microbatches (GBS 128) | 1354.0 | 1350.3 (−0.3%) |
+| GPU-bound, 4 microbatches (GBS 128) | 1346.8 | 1351.8 (+0.4%) |
 
-- **FlexShard is slightly ahead, again partly from work Megatron's defaults do.** Megatron's 1/DP scaling and NaN check take about 9 ms per step; without them, FlexShard would be about 0.4% behind (estimated from one profiled step). Newton-Schulz is balanced: each rank's Muon kernels take 6.4 ms in both stacks.
-- **Copies:** none in FlexShard's Muon buckets since flex_shard #46 (see [Design](#design)). Before it, FlexShard ran 1.1% behind, copying the gathered buffer into the parameters (15.9 ms per step on rank 0) and the gradients into the reduce-scatter buffer (5.1 ms).
+- **FlexShard is 0.4% behind with matched work.** With Megatron's defaults, it was 0.3% ahead (1350.3 vs 1354.0 ms/it, in an earlier session). Newton-Schulz is balanced: each rank's Muon kernels take 6.4 ms in both stacks.
+- **Copies:** none in FlexShard's Muon buckets since flex_shard #46 (see [Design](#design)). Before it, FlexShard ran 1.1% behind Megatron's defaults, copying the gathered buffer into the parameters (15.9 ms per step on rank 0) and the gradients into the reduce-scatter buffer (5.1 ms).
 - **Communication and memory:** FlexShard's Muon buckets close at four layers, as Megatron's do (six buckets of 218.1M elements each, with padding). Per step, its bucket collectives move 1.06× the 1.364B parameters, against Megatron's 1.10× (all-gather 2.88 vs 3.00 GB in bf16, reduce-scatter 5.76 vs 5.99 GB in fp32). It peaks at 38.8 vs 39.0 GB per rank.
 - **Correctness:** the iteration-1 loss and grad norm and the iteration-2 loss, the first after a Muon step, match exactly. Over 200 iterations at micro-batch size 1 and 4 microbatches (20 of warmup), FlexShard differs from Megatron by up to 3.7e-4, against 4.0e-4 between two Megatron runs. On the 117M model they also match exactly at DP 8, with reshard-after-forward, full recompute and PP 2, and an earlier composition matrix (syncing every microbatch, without fusion, untied embeddings, QKV without the split, MTP, PP 2, TP 2 with sequence parallelism, the small MoE model at EP 4) matched through iteration 2.
 - **Checkpoints,** on the 117M model at DP 8: FlexShard resumes at iteration 5 bit-exactly over iterations 6–10, Muon momentum and Adam moments included, as Megatron's own resume does, and Megatron and FlexShard load each other's weights (`--no-load-optim`) with the next loss and grad norm exact.
@@ -117,7 +117,6 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 ## Plan
 
 **Phase A (AdamW).** The 1.4B model results above cover the matched configuration, a 200-iteration correctness gate and performance. Next:
-- the matched comparison: `--ddp-average-in-collective --no-check-for-nan-in-loss-and-grad` for Megatron and `--no-check-for-nan-in-loss-and-grad` for FlexShard (the flag also turns off the loss check, which both stacks run);
 - the 7.2B model, with a 500-step correctness gate;
 - fixes for FlexShard's per-bucket CPU work, and bucket sizes against Megatron's `--ddp-bucket-size`.
 
