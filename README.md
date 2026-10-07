@@ -15,17 +15,17 @@ Setup: 8x H100 96 GB, TP = PP = 1, mock data. Models:
 
 ### Phase A results (1.4B model, DP 8)
 
-TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Runs are GPU-bound (micro-batch size 4, seq 4096) with 4 microbatches (GBS 128), 15 iterations each, timed as the median ms/it over iterations 7–15; a cell is the median of two runs. `BucketedBlockShard`, now the default, uses flex_shard #38, #42 and #39; `Shard(0)` is `--flex-shard-placement shard0`.
+TransformerEngine spec with gradient accumulation fusion on both sides, untied embeddings, `CUDA_DEVICE_MAX_CONNECTIONS=1`, lr 1e-4. Runs are GPU-bound (micro-batch size 4, seq 4096) with 4 microbatches (GBS 128), 15 iterations each, timed as the median ms/it over iterations 7–15; a cell is the median of two runs. FlexShard uses its default `BucketedBlockShard` layout.
 
-| Case | Megatron DDP + distributed optimizer, ms/it | FlexShard `Shard(0)` | FlexShard `BucketedBlockShard` |
-| --- | --- | --- | --- |
-| GPU-bound, 4 microbatches (GBS 128) | 1345.2 | 1353.2 (+0.6%) | 1346.0 (+0.1%) |
+| Case | Megatron DDP + distributed optimizer, ms/it | FlexShard |
+| --- | --- | --- |
+| GPU-bound, 4 microbatches (GBS 128) | 1345.2 | 1346.0 (+0.1%) |
 
-- **`BucketedBlockShard` matches Megatron,** and `Shard(0)` is within 0.6%.
-- **Megatron's defaults do work FlexShard skips.** Before each reduce-scatter, Megatron scales the gradients by 1/DP in a separate kernel (4.8 ms of GPU time per step; FlexShard averages inside the collective, as `--ddp-average-in-collective` does) and checks them for NaN (2.9 ms and 52 host syncs per step). Without that, Megatron would take an estimated 1337.5 ms/it, putting `BucketedBlockShard` about 0.6% behind (from one profiled step).
-- **Copies,** GPU time per profiled step on rank 0: `Shard(0)` spends 7.8–8.0 ms, about two thirds of it copying gradients into the reduce-scatter buffer. `BucketedBlockShard` spends 0.2–0.3 ms, on the embedding and final-norm buckets, which have no fused weight gradients. flex_shard #38, #42 and #39 took it from 17.9 to 9.9, 7.5 and 0.3 ms.
+- **FlexShard matches Megatron.**
+- **Megatron's defaults do work FlexShard skips.** Before each reduce-scatter, Megatron scales the gradients by 1/DP in a separate kernel (4.8 ms of GPU time per step; FlexShard averages inside the collective, as `--ddp-average-in-collective` does) and checks them for NaN (2.9 ms and 52 host syncs per step). Without that, Megatron would take an estimated 1337.5 ms/it, putting FlexShard about 0.6% behind (from one profiled step).
+- **Copies:** FlexShard spends 0.2–0.3 ms of GPU time per profiled step on copies (rank 0), on the embedding and final-norm buckets, which have no fused weight gradients. flex_shard #38, #42 and #39 took it from 17.9 to 9.9, 7.5 and 0.3 ms.
 - **Memory:** FlexShard uses 0.1–0.2 GB more: no-sync keeps full gradients between microbatches, as Megatron's persistent gradient buffer does.
-- **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 7.7e-3 for `Shard(0)` and 4.7e-3 for `BucketedBlockShard`, against 8.6e-3 between two Megatron runs. With `BucketedBlockShard`, checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
+- **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 4.7e-3, against 8.6e-3 between two Megatron runs. Checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
 ### Phase B results (1.4B model, DP 8)
 
