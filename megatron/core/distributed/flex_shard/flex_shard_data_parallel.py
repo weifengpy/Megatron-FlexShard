@@ -60,14 +60,14 @@ class FlexShardDataParallel(_BaseDataParallel):
 
     With gradient accumulation fusion, TransformerEngine's and Megatron's linear layers add
     weight gradients straight into ``param.main_grad`` and give autograd none. For buckets
-    with such layers, FlexShard's pre-backward hook allocates each gathered parameter's
-    gradient and aliases it as ``main_grad``, and its post-reduce hook drops the alias once
-    the reduce-scatter has taken the gradient. The fused GEMMs thus accumulate into the
-    gradient FlexShard reduce-scatters, across microbatches with no_sync. Activation recompute
+    with such layers, FlexShard's pre-backward hook allocates the gathered parameters'
+    gradients and aliases them as ``main_grad``, and its post-reduce hook drops the aliases
+    once the reduce-scatter has taken the gradients. The fused GEMMs thus accumulate into the
+    gradients FlexShard reduce-scatters, across microbatches with no_sync. Activation recompute
     runs a layer's forward again inside backward, after an original forward without gradients
     that left FlexShard no pre-backward hook for its bucket, so each fused layer also aliases
-    its gathered parameters' gradients in a forward pre-hook when its forward runs inside
-    backward.
+    its bucket's gathered parameters' gradients in a forward pre-hook when its forward runs
+    inside backward.
 
     With tied embeddings, the model fetches the output weight before it calls the output layer
     and passes it in at call time, so FlexShard cannot see that use from parameter names. On the
@@ -280,15 +280,12 @@ class FlexShardDataParallel(_BaseDataParallel):
             for i, fqns in enumerate(bucket_fqns)
         ]
         meshes = [self.expert_device_mesh if expert else self.device_mesh for expert in is_expert]
-        # BucketedBlockShard reduce-scatters a bucket of fused weight gradients as is when
-        # main_grad views it (gradient_bucket): the pre-backward hook then aliases the views
-        # flex_shard allocated instead of allocating each gradient. Muon's buckets keep whole
-        # matrices on their owners, and te_grouped.py views a single grouped weight's local rows
-        # as a GroupedTensor, so with either, no bucket uses BucketedBlockShard. A bucket holding
-        # a weight tied across pipeline stages (shared_embedding) keeps Shard(0):
-        # finalize_model_grads all-reduces the two copies' local shards, which line up only if
-        # both stages cut the weight alike, and BucketedBlockShard's cuts depend on the rest of
-        # each bucket.
+        # Muon's buckets keep whole matrices on their owners, and te_grouped.py views a single
+        # grouped weight's local rows as a GroupedTensor, so with either, no bucket uses
+        # BucketedBlockShard. A bucket holding a weight tied across pipeline stages
+        # (shared_embedding) keeps Shard(0): finalize_model_grads all-reduces the two copies'
+        # local shards, which line up only if both stages cut the weight alike, and
+        # BucketedBlockShard's cuts depend on the rest of each bucket.
         bucketed_block_shard = (
             ddp_config.placement == "bucketed-block"
             and not ddp_config.own_matrices
@@ -299,10 +296,6 @@ class FlexShardDataParallel(_BaseDataParallel):
             and not has_fp8[i]
             and not any(getattr(params[fqn], "shared_embedding", False) for fqn in fqns)
             for i, fqns in enumerate(bucket_fqns)
-        ]
-        gradient_bucket = [
-            bucketed_block[i] and uses_main_grad[i]
-            for i in range(len(bucket_fqns))
         ]
         self.buckets = [
             BucketSpec(
@@ -340,7 +333,6 @@ class FlexShardDataParallel(_BaseDataParallel):
                     else {}
                 ),
                 **(dict(defer_post_backward=True) if deferred[i] else {}),
-                gradient_bucket=gradient_bucket[i],
             )
             for i, fqns in enumerate(bucket_fqns)
         ]
@@ -365,13 +357,16 @@ class FlexShardDataParallel(_BaseDataParallel):
                 setattr(param, attr_name, attr_value)
             param.is_flex_shard_param = True
 
+        main_grad_bucket = {fqn: fqns for fqns in self._main_grad_bucket_fqns for fqn in fqns}
         fused_owners: Dict[torch.nn.Module, List[str]] = {}
         for fqn in fused_fqns:
-            owner_path, _, param_name = fqn.rpartition(".")
-            fused_owners.setdefault(self.module.get_submodule(owner_path), []).append(param_name)
-        for owner, param_names in fused_owners.items():
+            owner_fqns = fused_owners.setdefault(
+                self.module.get_submodule(fqn.rpartition(".")[0]), []
+            )
+            owner_fqns.extend(f for f in main_grad_bucket[fqn] if f not in owner_fqns)
+        for owner, owner_fqns in fused_owners.items():
             owner.register_forward_pre_hook(
-                functools.partial(self._alias_main_grads_in_recompute, param_names)
+                functools.partial(self._alias_main_grads_in_recompute, owner_fqns)
             )
 
         log_single_rank(
@@ -388,7 +383,6 @@ class FlexShardDataParallel(_BaseDataParallel):
             f"fp8 weights={len(fp8_fqns)}, "
             f"owned buckets={sum(owned)}, "
             f"bucketed block buckets={sum(bucketed_block)}, "
-            f"gradient buckets={sum(gradient_bucket)}, "
             f"single grouped params={num_grouped}, "
             f"tied embeddings={tied is not None}, "
             f"local params={sum(p.numel() for p in self.module.parameters())}",
@@ -447,20 +441,38 @@ class FlexShardDataParallel(_BaseDataParallel):
         """FlexShard pre-backward hook: expose each gathered parameter's gradient as main_grad.
 
         Fused gradient accumulation adds weight gradients into ``main_grad`` in place, so the
-        gradient must exist before the bucket's backward. A missing one is allocated zeroed in
-        the accumulation dtype, which autograd's gradients for unfused parameters also add into.
-        Without gradient sync, FlexShard keeps it for the next microbatch.
+        gradient must exist before the bucket's backward. Missing ones are allocated zeroed in
+        the accumulation dtype, which autograd's gradients for unfused parameters also add into,
+        as views of one buffer per storage the gathered parameters view, at their offsets. With
+        BucketedBlockShard and Muon buckets, whose parameters view one gathered bucket, that
+        buffer is in the bucket's layout, so FlexShard reduce-scatters it without copying the
+        gradients in. Without gradient sync, FlexShard keeps them for the next microbatch.
         """
+        buffers: Dict[int, torch.Tensor] = {}
         for _, param in named_params:
             if not param.requires_grad:
                 continue
             if param.grad is None:
                 dtype = torch.float32 if self.ddp_config.grad_reduce_in_fp32 else param.dtype
-                param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
+                if type(param.data) is not torch.Tensor:
+                    # A tensor subclass (a gathered FP8 weight) has no plain buffer to mirror.
+                    param.grad = torch.zeros(param.shape, dtype=dtype, device=param.device)
+                else:
+                    storage = param.untyped_storage()
+                    buffer = buffers.get(storage._cdata)
+                    if buffer is None:
+                        buffer = torch.zeros(
+                            storage.nbytes() // param.element_size(),
+                            dtype=dtype,
+                            device=param.device,
+                        )
+                        buffers[storage._cdata] = buffer
+                    offset = param.storage_offset()
+                    param.grad = buffer[offset : offset + param.numel()].view(param.shape)
             param.main_grad = param.grad
 
     def _alias_main_grads_in_recompute(
-        self, param_names: List[str], module: torch.nn.Module, args: Tuple
+        self, fqns: List[str], module: torch.nn.Module, args: Tuple
     ) -> None:
         """Forward pre-hook of a layer with fused weight gradients, for activation recompute.
 
@@ -469,10 +481,11 @@ class FlexShardDataParallel(_BaseDataParallel):
         has aliased ``main_grad`` before the recomputed backward adds into it. A forward with
         gradients inside backward is such a recompute (the test flex_shard's ``_in_backward``
         uses). FlexShard's own pre-forward hook, on this module or an ancestor, has already
-        swapped in the gathered parameters.
+        swapped in the gathered parameters of the module's bucket, ``fqns``, which are aliased
+        together so their gradients share one buffer.
         """
         if torch.is_grad_enabled() and torch._C._current_graph_task_id() != -1:
-            self._alias_main_grads([(name, module._parameters[name]) for name in param_names])
+            self._alias_main_grads([(fqn, self.module.get_parameter(fqn)) for fqn in fqns])
 
     def unshard(self) -> None:
         """Gather every bucket for a schedule that calls the layers' sub-modules directly (the
