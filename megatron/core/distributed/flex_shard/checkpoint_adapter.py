@@ -23,11 +23,12 @@ DCP's ``CheckpointableTensor`` layout: per chunk, a global offset, a local offse
   factory's data with each optimizer state of the parameter (``make_sharded_optimizer_tensor``),
   reuses it for the fp32 main parameters and Adam moments, which have the shard's shape.
 - A rank holding none of a parameter (e.g. with ``BucketedBlockShard``, whose ranks hold
-  contiguous ranges of a bucket, or a parameter with fewer rows than ranks) still emits one
-  piece: a zero-size one just past Megatron's first piece. Without it, rank 0 would save the
-  empty list of pieces in the checkpoint's common state, and positional lists such as the
-  optimizer's ``fp32_from_fp16_params`` would differ in length across ranks, so loading would
-  fail to merge them.
+  contiguous ranges of a bucket, Muon's whole matrices on other ranks, or a parameter with fewer
+  rows than ranks) still emits one piece: a zero-size one at the end of the global tensor along
+  an empty dim, where no real chunk starts. Without it, rank 0 would save the empty list of
+  pieces in the checkpoint's common state, and positional lists such as the optimizer's
+  ``fp32_from_fp16_params`` would differ in length across ranks, so loading would fail to merge
+  them.
 
 The checkpoint thus has Megatron DDP's keys and global shapes, and the two load each other's.
 """
@@ -76,6 +77,8 @@ class _ChunkPlan:
 
     def __init__(self, regions: List[Region], layout: Any, local_shape: torch.Size):
         self.local_shape = local_shape
+        # The empty dim of a rank that holds none of the parameter (see below), else None.
+        self.empty_dim: Optional[int] = None
         # (piece index, start in the full parameter, size, start in the local shard)
         self.chunks: List[Tuple[int, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = []
         for index, (r_start, r_size) in enumerate(regions):
@@ -97,15 +100,14 @@ class _ChunkPlan:
                     )
                 )
         if not self.chunks:
-            # This rank holds none of the parameter (an empty shard): one zero-size piece, past
-            # the end of the first piece along an empty dim, where no real chunk starts (DCP
-            # dedups chunks of one key that start at the same offset).
+            # This rank holds none of the parameter (an empty shard): one zero-size piece, which
+            # build puts at the end of the global tensor along an empty dim. DCP keeps one of the
+            # chunks of a key that start at the same offset, so the piece must not start where a
+            # real chunk does, as just past the first piece would, e.g. where the up half of
+            # SwiGLU's fc1 starts.
             assert local_shape.numel() == 0, local_shape
-            r_start, r_size = regions[0]
-            dim = list(local_shape).index(0)
-            start = list(r_start)
-            start[dim] += r_size[dim]
-            self.chunks.append((0, tuple(start), tuple(local_shape), (0,) * len(local_shape)))
+            self.empty_dim = list(local_shape).index(0)
+            self.chunks.append((0, regions[0][0], tuple(local_shape), (0,) * len(local_shape)))
         self.regions = regions
 
     @staticmethod
@@ -127,6 +129,11 @@ class _ChunkPlan:
             global_offset = piece.global_offset[:prepend] + tuple(
                 g + s - r for g, s, r in zip(piece.global_offset[prepend:], start, r_start)
             )
+            if self.empty_dim is not None:
+                axis = prepend + self.empty_dim
+                global_offset = (
+                    global_offset[:axis] + (piece.global_shape[axis],) + global_offset[axis + 1 :]
+                )
             out.append(
                 dataclasses.replace(
                     piece,
