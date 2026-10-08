@@ -577,16 +577,22 @@ class FlexShardDataParallel(_BaseDataParallel):
     def _group_muon_layers(
         self, bucket_fqns: List[List[str]], bucket_size: Optional[int]
     ) -> Tuple[List[List[str]], List[Optional[List[str]]]]:
-        """Merge runs of consecutive TransformerLayer buckets holding Muon matrices into buckets
-        of several layers, returned with the layers' module names, which the merged buckets
-        use as patterns so that flex_shard hooks them on those layers' forwards.
+        """Merge runs of buckets holding Muon matrices into buckets of several layers, returned
+        with the modules that the merged buckets use as patterns, so that flex_shard hooks them
+        on those modules' forwards.
 
         Muon's whole matrices on owner ranks pad every rank's share of a bucket to the largest
-        one, so a one-layer bucket (four matrices for eight ranks) moves several times its
-        bytes. Megatron's layer-wise distributed Muon closes a bucket, walking in backprop
-        order, once it holds max(bucket_size, 0.9 x DP x its largest matrix) elements; this does
-        the same with whole layers, since a bucket's hooks sit on whole layers. MoE layers
-        alternate with their experts' buckets, so they stay one per layer.
+        one, so a one-layer bucket (a few matrices for eight ranks) moves and keeps several
+        times its bytes. Megatron's layer-wise distributed Muon closes a bucket, walking in
+        backprop order, once it holds max(bucket_size, 0.9 x DP x its largest matrix) elements;
+        this does the same with whole modules, since a bucket's hooks sit on whole modules:
+        TransformerLayers, other modules holding Muon matrices (e.g. MTP's projection), and a
+        MoE layer's non-expert parameters, which name the layer's modules other than its
+        experts (attention, router, shared experts, norms). Expert buckets and buckets without
+        a Muon matrix (norms, the embedding) stay on their own, after the merged bucket. A
+        layer far larger than the others (e.g. a dense layer among MoE layers) pads a bucket
+        unless that bucket holds enough of the others, so this keeps whichever walk, in
+        backprop or forward order, pads less.
         """
         params = dict(self.module.named_parameters())
         dp_size = self.device_mesh.size()
@@ -594,46 +600,86 @@ class FlexShardDataParallel(_BaseDataParallel):
             # Megatron DDP's default (DistributedDataParallel).
             bucket_size = max(40000000, 1000000 * dp_size)
 
-        def is_muon_layer(fqns: List[str]) -> bool:
-            # The whole layer, which a module pattern names.
+        def merge_modules(fqns: List[str]) -> Optional[List[str]]:
+            """The modules a merged bucket names for this bucket: its module when the bucket
+            holds all of it, or a MoE layer's modules without experts when it holds all of the
+            layer's non-expert parameters. None for any other bucket, or one without a Muon
+            matrix."""
+            if not any(_is_muon_matrix(params[fqn]) for fqn in fqns) or any(
+                _is_expert_param(params[fqn]) for fqn in fqns
+            ):
+                return None
             path = _common_module_path(fqns)
-            layer = self.module.get_submodule(path)
-            return (
-                isinstance(layer, TransformerLayer)
-                and len(fqns) == len(list(layer.parameters()))
-                and any(_is_muon_matrix(params[fqn]) for fqn in fqns)
-                and not any(_is_expert_param(params[fqn]) for fqn in fqns)
-            )
+            module = self.module.get_submodule(path)
+            module_params = list(module.parameters())
+            num_dense = sum(not _is_expert_param(param) for param in module_params)
+            if len(fqns) != num_dense:
+                return None
+            if num_dense == len(module_params):
+                return [path]
+            if not isinstance(module, TransformerLayer):
+                return None
+            return [f"{path}.{name}" for name in _modules_without_experts(module)]
 
-        grouped_fqns: List[List[str]] = []
-        grouped_layers: List[Optional[List[str]]] = []
-        start = 0
-        while start < len(bucket_fqns):
-            end = start
-            while end < len(bucket_fqns) and is_muon_layer(bucket_fqns[end]):
-                end += 1
-            if end == start:
-                grouped_fqns.append(bucket_fqns[start])
-                grouped_layers.append(None)
-                start += 1
-                continue
-            groups: List[List[List[str]]] = [[]]
-            for layer in reversed(bucket_fqns[start:end]):
-                if groups[0]:
-                    fqns = [fqn for group_layer in groups[0] for fqn in group_layer]
+        def partition(run: list, backward: bool) -> List[list]:
+            groups: List[list] = [[]]
+            for entry in reversed(run) if backward else run:
+                if groups[-1]:
+                    fqns = [fqn for bucket, _, _ in groups[-1] for fqn in bucket]
                     numel = sum(params[fqn].numel() for fqn in fqns)
                     largest = max(
                         params[fqn].numel() for fqn in fqns if _is_muon_matrix(params[fqn])
                     )
                     if numel >= max(bucket_size, int(0.9 * dp_size * largest)):
-                        groups.insert(0, [])
-                groups[0].insert(0, layer)
+                        groups.append([])
+                groups[-1].append(entry)
+            return [group[::-1] for group in groups[::-1]] if backward else groups
+
+        def padded_numel(groups: List[list]) -> int:
+            """A lower bound on the groups' padded rows: every rank's row holds at least the
+            group's largest parameter and its share of the group."""
+            total = 0
             for group in groups:
-                grouped_fqns.append([fqn for layer in group for fqn in layer])
+                numels = [params[fqn].numel() for bucket, _, _ in group for fqn in bucket]
+                total += dp_size * max(max(numels), -(-sum(numels) // dp_size))
+            return total
+
+        grouped_fqns: List[List[str]] = []
+        grouped_layers: List[Optional[List[str]]] = []
+
+        def flush(run: list) -> None:
+            groups = min(partition(run, True), partition(run, False), key=padded_numel)
+            for group in groups:
+                grouped_fqns.append([fqn for bucket, _, _ in group for fqn in bucket])
                 grouped_layers.append(
-                    [_common_module_path(layer) for layer in group] if len(group) > 1 else None
+                    [module for _, modules, _ in group for module in modules]
+                    if len(group) > 1
+                    else None
                 )
-            start = end
+                for _, _, followers in group:
+                    grouped_fqns.extend(followers)
+                    grouped_layers.extend([None] * len(followers))
+
+        # A run of mergeable buckets, each with the expert buckets and buckets without a Muon
+        # matrix that follow it.
+        run: list = []
+        for fqns in bucket_fqns:
+            modules = merge_modules(fqns)
+            if modules is not None:
+                run.append((fqns, modules, []))
+            elif run and (
+                all(_is_expert_param(params[fqn]) for fqn in fqns)
+                or not any(_is_muon_matrix(params[fqn]) for fqn in fqns)
+            ):
+                run[-1][2].append(fqns)
+            else:
+                if run:
+                    flush(run)
+                    run = []
+                grouped_fqns.append(fqns)
+                grouped_layers.append(None)
+        if run:
+            flush(run)
         return grouped_fqns, grouped_layers
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: Tuple = (), metadata=None):
@@ -763,6 +809,25 @@ def _owned_placement_fn(owners: Dict[str, int]):
         return {fqn: (placement,) for fqn, _ in named_params}
 
     return placement_fn
+
+
+def _modules_without_experts(module: torch.nn.Module) -> List[str]:
+    """Names, relative to ``module``, of the fewest submodules that hold all of its non-expert
+    parameters and none of its expert ones (e.g. a MoE layer's attention, router, shared
+    experts and norms)."""
+    assert not list(module.parameters(recurse=False)), (
+        f"{type(module).__name__} holds parameters of its own next to expert submodules"
+    )
+    names = []
+    for name, child in module.named_children():
+        child_params = list(child.parameters())
+        if not child_params or all(_is_expert_param(param) for param in child_params):
+            continue
+        if not any(_is_expert_param(param) for param in child_params):
+            names.append(name)
+        else:
+            names.extend(f"{name}.{sub}" for sub in _modules_without_experts(child))
+    return names
 
 
 def _common_module_path(fqns: List[str]) -> str:
