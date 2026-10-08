@@ -12,6 +12,7 @@ Setup: 8x H100 96 GB, TP = PP = 1, mock data. Models:
 - **7.2B model:** Llama-3-8B layers (32 layers, hidden 4096, ffn 14336, GQA 32/8) with a 32K vocabulary, run with `--recompute-granularity selective`, without which Megatron with the distributed optimizer runs out of memory.
 - **Small MoE model:** 4 layers, hidden 1024, 8 experts, top-2, expert FFN 2048, grouped GEMM, all-to-all dispatcher, tied embeddings.
 - **10B MoE model:** 16 of Qwen3-30B-A3B's 48 layers.
+- **DeepSeek-V3 model:** DeepSeek-V3's layers at full width, fewer of them and with fewer experts. Hidden 7168; multi-head latent attention (128 heads, q-lora rank 1536, kv-lora rank 512, qk head dim 128 plus rope head dim 64, v head dim 128, q/kv layernorms); 8 layers, 1 dense (FFN 18432) and 7 MoE, plus 1 MTP layer; 32 routed experts (FFN 2048; DeepSeek-V3 has 256) with top-8 sigmoid routing, expert bias and top-4 of 8 groups, plus 1 shared expert; untied embeddings, all-to-all dispatcher.
 
 ### Phase A results (1.4B model, DP 8)
 
@@ -26,6 +27,17 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 - **Copies:** FlexShard spends 0.2–0.3 ms of GPU time per profiled step on copies (rank 0), on the embedding and final-norm buckets, which have no fused weight gradients. flex_shard #38, #42 and #39 took it from 17.9 to 9.9, 7.5 and 0.3 ms.
 - **Memory:** FlexShard uses 0.1–0.2 GB more: no-sync keeps full gradients between microbatches, as Megatron's persistent gradient buffer does.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 4.7e-3, against 8.6e-3 between two Megatron runs. Checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
+
+### Phase A results on the DeepSeek-V3 model (DP 8, EP 4)
+
+Phase A's stacks, settings and matched work on the DeepSeek-V3 model, with expert parallelism: dense parameters shard over all 8 ranks, and experts split 4 ways by expert parallelism, with expert data parallelism 2, so FlexShard shards each expert over 2 ranks (its dense and expert buckets use `BucketedBlockShard`). Runs are GPU-bound at seq 4096, micro-batch size 1 and 4 microbatches (GBS 32): a profiled step keeps the GPU busy 98% of the time on some stream. Each run is 10 iterations, timed as the median ms/it over iterations 4–10; a cell is the median of two interleaved runs.
+
+| Case | Megatron DDP + distributed optimizer, ms/it | FlexShard |
+| --- | --- | --- |
+| GPU-bound, 4 microbatches (GBS 32) | 1659.0 | 1639.4 (−1.2%) |
+
+- **Correctness:** iterations 1 and 2 match Megatron's loss and grad norm exactly. Over the 10 iterations, the largest loss difference from Megatron is 8.6e-4, against 1.2e-3 between Megatron's two runs.
+- **Memory:** FlexShard peaks at 73.7 GB per rank, against Megatron's 72.0 GB.
 
 ### Phase B results (1.4B model, DP 8)
 
@@ -122,7 +134,7 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 
 Protocol: the median ms/it over iterations ≥ 20, the min and median of at least 3 interleaved repetitions, peak allocated memory, and one profiled step per setup. For correctness, a stable lr (1e-4 with warmup; 3e-4 diverges in every setup) and two Megatron runs as the noise floor, since TransformerEngine kernels aren't bit-deterministic.
 
-**Phase B (Muon)** is done; see its results above.
+**Phase B (Muon)** is done on the 1.4B model; see its results above. On the DeepSeek-V3 model, FlexShard's Muon runs out of memory: its MoE layers' Muon buckets aren't grouped across layers as dense layers' are, so each holds a few large matrices whose owner rows are mostly padding (about 4x the real size). Next: group consecutive MoE layers' non-expert parameters into one Muon bucket.
 
 **Phase C:** Megatron-FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params`) vs FlexShard with reshard-after-forward, both ZeRO-3, for models that don't fit with full parameters resident. Measure with Phase A's protocol, then close gaps. So far, on the 1.4B model with reshard-after-forward (GPU-bound, 1 microbatch), `BucketedBlockShard` takes 361.6 ms/it against `Shard(0)`'s 371.3 (−2.6%), at 31.4 vs 31.5 GB.
 
