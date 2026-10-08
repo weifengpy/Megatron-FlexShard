@@ -36,6 +36,7 @@ Phase A's stacks, settings and matched work on the DeepSeek-V3 model, with exper
 | --- | --- | --- |
 | GPU-bound, 4 microbatches (GBS 32) | 1659.0 | 1639.4 (−1.2%) |
 
+- **Megatron with bigger buckets:** the row above uses Megatron's default buckets, about 40M parameters (31 dense and 56 expert buckets on this model). With `--ddp-bucket-size 250000000` (10 and 11 buckets), Megatron takes 1647.1 ms/it against FlexShard's 1626.5 in the same session; with 500M-parameter buckets (6 and 6), 1662.0. One run each so far.
 - **Correctness:** iterations 1 and 2 match Megatron's loss and grad norm exactly. Over the 10 iterations, the largest loss difference from Megatron is 8.6e-4, against 1.2e-3 between Megatron's two runs.
 - **Memory:** FlexShard peaks at 73.7 GB per rank, against Megatron's 72.0 GB.
 
