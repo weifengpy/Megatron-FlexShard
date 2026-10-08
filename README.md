@@ -12,6 +12,7 @@ Setup: 8x H100 96 GB, TP = PP = 1, mock data. Models:
 - **7.2B model:** Llama-3-8B layers (32 layers, hidden 4096, ffn 14336, GQA 32/8) with a 32K vocabulary, run with `--recompute-granularity selective`, without which Megatron with the distributed optimizer runs out of memory.
 - **Small MoE model:** 4 layers, hidden 1024, 8 experts, top-2, expert FFN 2048, grouped GEMM, all-to-all dispatcher, tied embeddings.
 - **10B MoE model:** 16 of Qwen3-30B-A3B's 48 layers.
+- **DeepSeek-V3 model:** DeepSeek-V3's layers at full width, fewer of them and with fewer experts. Hidden 7168; multi-head latent attention (128 heads, q-lora rank 1536, kv-lora rank 512, qk head dim 128 plus rope head dim 64, v head dim 128, q/kv layernorms); 8 layers, 1 dense (FFN 18432) and 7 MoE, plus 1 MTP layer; 32 routed experts (FFN 2048; DeepSeek-V3 has 256) with top-8 sigmoid routing, expert bias and top-4 of 8 groups, plus 1 shared expert; untied embeddings, all-to-all dispatcher.
 
 ### Phase A results (1.4B model, DP 8)
 
@@ -27,6 +28,17 @@ TransformerEngine spec with gradient accumulation fusion on both sides, untied e
 - **Memory:** FlexShard uses 0.1–0.2 GB more: no-sync keeps full gradients between microbatches, as Megatron's persistent gradient buffer does.
 - **Correctness:** iteration-1 loss matches Megatron's exactly in every run. Over 200 iterations at micro-batch size 1 and 4 microbatches, the largest loss difference from Megatron is 4.7e-3, against 8.6e-3 between two Megatron runs. Checkpoints on the 4-layer model resume within 1e-4 of an uninterrupted run, as Megatron's own resume does, and cross-load with Megatron's exactly.
 
+### Phase A results on the DeepSeek-V3 model (DP 8, EP 4)
+
+Phase A's stacks, settings and matched work on the DeepSeek-V3 model, with expert parallelism: dense parameters shard over all 8 ranks, and experts split 4 ways by expert parallelism, with expert data parallelism 2, so FlexShard shards each expert over 2 ranks (its dense and expert buckets use `BucketedBlockShard`). Runs are GPU-bound at seq 4096, micro-batch size 1 and 4 microbatches (GBS 32): a profiled step keeps the GPU busy 98% of the time on some stream. Each run is 10 iterations, timed as the median ms/it over iterations 4–10; a cell is the median of two interleaved runs.
+
+| Case | Megatron DDP + distributed optimizer, ms/it | FlexShard |
+| --- | --- | --- |
+| GPU-bound, 4 microbatches (GBS 32) | 1659.0 | 1639.4 (−1.2%) |
+
+- **Correctness:** iterations 1 and 2 match Megatron's loss and grad norm exactly. Over the 10 iterations, the largest loss difference from Megatron is 8.6e-4, against 1.2e-3 between Megatron's two runs.
+- **Memory:** FlexShard peaks at 73.7 GB per rank, against Megatron's 72.0 GB.
+
 ### Phase B results (1.4B model, DP 8)
 
 Phase A's setup, matched work included, with `--optimizer muon` on both sides: Megatron DDP + layer-wise distributed Muon vs FlexShard. Both run Megatron's `TensorParallelMuon` (Emerging-Optimizers v0.3.0, Megatron's pin) on whole matrices on their owner ranks, so they compute the same update; Megatron all-gathers parameters after the step, FlexShard in the next forward. torchtitan's DistMuon computes a different update, so FlexShard runs Megatron's.
@@ -40,6 +52,18 @@ Phase A's setup, matched work included, with `--optimizer muon` on both sides: M
 - **Communication and memory:** FlexShard's Muon buckets close at four layers, as Megatron's do (six buckets of 218.1M elements each, with padding). Per step, its bucket collectives move 1.06× the 1.364B parameters, against Megatron's 1.10× (all-gather 2.88 vs 3.00 GB in bf16, reduce-scatter 5.76 vs 5.99 GB in fp32). It peaks at 38.8 vs 39.0 GB per rank.
 - **Correctness:** the iteration-1 loss and grad norm and the iteration-2 loss, the first after a Muon step, match exactly. Over 200 iterations at micro-batch size 1 and 4 microbatches (20 of warmup), FlexShard differs from Megatron by up to 3.7e-4, against 4.0e-4 between two Megatron runs. On the 117M model they also match exactly at DP 8, with reshard-after-forward, full recompute and PP 2, and an earlier composition matrix (syncing every microbatch, without fusion, untied embeddings, QKV without the split, MTP, PP 2, TP 2 with sequence parallelism, the small MoE model at EP 4) matched through iteration 2.
 - **Checkpoints,** on the 117M model at DP 8: FlexShard resumes at iteration 5 bit-exactly over iterations 6–10, Muon momentum and Adam moments included, as Megatron's own resume does, and Megatron and FlexShard load each other's weights (`--no-load-optim`) with the next loss and grad norm exact.
+
+### Phase B results on the DeepSeek-V3 model (DP 8, EP 4)
+
+The DeepSeek-V3 model's Phase A setup, matched work included, with `--optimizer muon` on both sides: Megatron DDP + layer-wise distributed Muon vs FlexShard. Expert matrices are owned within the expert data-parallel group of 2.
+
+| Case | Megatron DDP + layer-wise distributed Muon, ms/it | FlexShard |
+| --- | --- | --- |
+| GPU-bound, 4 microbatches (GBS 32) | 1990.2 | 1926.0 (−3.2%) |
+
+- **Buckets:** FlexShard merges consecutive MoE layers' non-expert parameters (latent attention, shared expert, router, norms) and MTP's matrices into shared Muon buckets across layers, as it does for dense layers. That takes its owned Muon buckets from 18 to 10. Unmerged, each MoE layer's bucket held a few large matrices whose owner rows were mostly padding (about 4x the real size), and FlexShard ran out of memory.
+- **Correctness:** iterations 1 and 2 match Megatron's loss and grad norm exactly. Over the 10 iterations, FlexShard's two runs differ from Megatron's four (from two sessions) by up to 8.8e-4 in loss, against up to 1.0e-3 between Megatron's own runs.
+- **Memory:** FlexShard peaks at 70.9 GB per rank, against Megatron's 76.3 GB.
 
 ## Usage
 
@@ -122,7 +146,7 @@ For the Megatron baseline, replace the last line with `--use-distributed-optimiz
 
 Protocol: the median ms/it over iterations ≥ 20, the min and median of at least 3 interleaved repetitions, peak allocated memory, and one profiled step per setup. For correctness, a stable lr (1e-4 with warmup; 3e-4 diverges in every setup) and two Megatron runs as the noise floor, since TransformerEngine kernels aren't bit-deterministic.
 
-**Phase B (Muon)** is done; see its results above.
+**Phase B (Muon)** is done on the 1.4B and DeepSeek-V3 models; see their results above.
 
 **Phase C:** Megatron-FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params`) vs FlexShard with reshard-after-forward, both ZeRO-3, for models that don't fit with full parameters resident. Measure with Phase A's protocol, then close gaps. So far, on the 1.4B model with reshard-after-forward (GPU-bound, 1 microbatch), `BucketedBlockShard` takes 361.6 ms/it against `Shard(0)`'s 371.3 (−2.6%), at 31.4 vs 31.5 GB.
 
